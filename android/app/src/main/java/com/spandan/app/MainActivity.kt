@@ -5,13 +5,20 @@ import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.os.Bundle
 import android.os.Handler
+import android.os.Build
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.View
 import android.widget.Button
+import android.widget.EditText
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.SwitchCompat
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageAnalysis
@@ -24,14 +31,27 @@ import androidx.core.view.WindowInsetsCompat
 import com.spandan.app.camera.CoordinateMapper
 import com.spandan.app.camera.FaceAnalysisResult
 import com.spandan.app.camera.FaceAnalyzer
+import com.spandan.app.oximetry.CalibrationCsvFormat
+import com.spandan.app.oximetry.CalibrationRecorder
+import com.spandan.app.oximetry.CameraCapabilityProbe
+import com.spandan.app.oximetry.OximetryCaptureController
+import com.spandan.app.oximetry.OximetryCaptureController.LockState
+import com.spandan.app.oximetry.OximetryMath
+import com.spandan.app.oximetry.ZeroLightMeter
+import com.spandan.app.oximetry.ZeroLightOffset
+import com.spandan.app.oximetry.asText
 import com.spandan.app.signal.DisplaySmoother
 import com.spandan.app.signal.EstimatorStatus
 import com.spandan.app.signal.LiveSpo2Estimator
 import com.spandan.app.signal.MorphologyWaveformEstimator
 import com.spandan.app.signal.RealHeartRateEstimator
+import com.spandan.app.signal.RgbSample
 import com.spandan.app.signal.SignalBuffer
 import com.spandan.app.ui.OverlayView
 import com.spandan.app.ui.WaveformView
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -96,6 +116,32 @@ class MainActivity : AppCompatActivity() {
     // from "changed while backgrounded" -- see onResume() below.
     private var permissionGrantedLastKnown = false
 
+    // [Segment 34] Oximetry-grade capture + calibration recorder. OFF by
+    // default (USE_OXIMETRY_CAPTURE_DEFAULT); switchable at runtime from the
+    // developer panel (long-press the vitals card). When off, the camera is
+    // configured exactly as before -- the controller only reads capture
+    // results. The displayed SpO2 formula is NOT changed by any of this.
+    private var useOximetryCapture = USE_OXIMETRY_CAPTURE_DEFAULT
+    private val oximetry = OximetryCaptureController()
+    private var cameraCapabilities: CameraCapabilityProbe.Capabilities? = null
+    private val zeroLightMeter = ZeroLightMeter()
+    private lateinit var recorder: CalibrationRecorder
+    private var recordStartSensorNs = 0L
+    private var recordStartElapsedNs = 0L
+    private var lastFrameSensorNs = 0L
+    private var lastFrameReceiptElapsedNs = 0L
+    private var lastRotatedWidth = 0
+    private var lastRotatedHeight = 0
+    private var lastHrBpm: Double? = null
+    private var lastSpo2: Double? = null
+    private lateinit var calibrationPanel: View
+    private lateinit var elapsedText: TextView
+    private lateinit var oximetryStatusText: TextView
+    private lateinit var oximetrySwitch: SwitchCompat
+    private lateinit var lightingInput: EditText
+    private lateinit var recordButton: Button
+    private var zeroLightNote: String = ""
+
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             permissionGrantedLastKnown = granted
@@ -119,6 +165,7 @@ class MainActivity : AppCompatActivity() {
         morphologyWaveformView = findViewById(R.id.morphologyWaveformView)
         morphologyStatusDot = findViewById(R.id.morphologyStatusDot)
         morphologyStatusLabel = findViewById(R.id.morphologyStatusLabel)
+        setUpCalibrationPanel()
 
         // App targets SDK 35, where edge-to-edge is enforced -- content draws
         // behind system bars by default. Without this, the bottom HR/SpO2
@@ -194,33 +241,59 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    @OptIn(ExperimentalGetImage::class)
+    @OptIn(ExperimentalGetImage::class, ExperimentalCamera2Interop::class)
     private fun bindUseCases() {
         val provider = cameraProvider ?: return
         provider.unbindAll()
 
-        val preview = Preview.Builder().build().also {
+        // [Segment 34] Task 1 capability probe -- logged once (SPANDAN_CAPS).
+        if (cameraCapabilities == null) {
+            cameraCapabilities = try {
+                CameraCapabilityProbe.frontCameraId(this)?.let { CameraCapabilityProbe.probe(this, it) }
+            } catch (e: Exception) {
+                Log.e(TAG, "Camera capability probe failed", e)
+                null
+            }
+        }
+
+        val previewBuilder = Preview.Builder()
+        val analysisBuilder = ImageAnalysis.Builder()
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+        // [Segment 34] read-only capture-result callback always; capture
+        // request options only when useOximetryCapture is on.
+        oximetry.configure(analysisBuilder, previewBuilder, cameraCapabilities, useOximetryCapture)
+
+        val preview = previewBuilder.build().also {
             it.setSurfaceProvider(previewView.surfaceProvider)
         }
 
-        val analysis = ImageAnalysis.Builder()
-            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            .build()
+        val analysis = analysisBuilder.build()
 
         val analyzer = FaceAnalyzer { result ->
             // Analyzer callback runs on analysisExecutor; hop back to the
             // main thread before touching any views.
             uiHandler.post { handleAnalysisResult(result) }
         }
-        analysis.setAnalyzer(analysisExecutor, analyzer)
+        // [Segment 34] zeroLightMeter.offer is a no-op unless the developer
+        // zero-light measurement is running.
+        analysis.setAnalyzer(analysisExecutor) { imageProxy ->
+            zeroLightMeter.offer(imageProxy)
+            analyzer.analyze(imageProxy)
+        }
 
         try {
-            provider.bindToLifecycle(
+            val camera = provider.bindToLifecycle(
                 this,
                 CameraSelector.DEFAULT_FRONT_CAMERA,
                 preview,
                 analysis
             )
+            val boundId = Camera2CameraInfo.from(camera.cameraInfo).cameraId
+            if (boundId != cameraCapabilities?.cameraId) {
+                Log.w(TAG, "Bound camera $boundId differs from probed ${cameraCapabilities?.cameraId}; probing it (takes effect on next bind)")
+                cameraCapabilities = CameraCapabilityProbe.probe(this, boundId)
+            }
+            oximetry.onCameraBound(camera, useOximetryCapture)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to bind CameraX use cases", e)
         }
@@ -247,8 +320,222 @@ class MainActivity : AppCompatActivity() {
                 overlayView.update(faceView, roiView)
 
                 result.rgbSample?.let { signalBuffer.add(it) }
+
+                // [Segment 34] exposure metering + calibration CSV row.
+                lastFrameSensorNs = result.sensorTimestampNs
+                lastFrameReceiptElapsedNs = SystemClock.elapsedRealtimeNanos()
+                lastRotatedWidth = result.rotatedImageWidth
+                lastRotatedHeight = result.rotatedImageHeight
+                result.rgbSample?.let { s ->
+                    oximetry.onRoiSample(result.sensorTimestampNs, s.red.toDouble(), s.green.toDouble(), s.blue.toDouble())
+                    if (recorder.isRecording) writeCalibrationRow(result, s)
+                }
             }
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // [Segment 34] developer calibration panel + recorder
+    // ---------------------------------------------------------------------
+
+    private fun setUpCalibrationPanel() {
+        recorder = CalibrationRecorder(getExternalFilesDir(null) ?: filesDir)
+        calibrationPanel = findViewById(R.id.calibrationPanel)
+        elapsedText = findViewById(R.id.elapsedText)
+        oximetryStatusText = findViewById(R.id.oximetryStatusText)
+        oximetrySwitch = findViewById(R.id.oximetrySwitch)
+        lightingInput = findViewById(R.id.lightingInput)
+        recordButton = findViewById(R.id.recordButton)
+
+        findViewById<View>(R.id.vitalsCard).setOnLongClickListener {
+            calibrationPanel.visibility = if (calibrationPanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+            true
+        }
+        oximetrySwitch.isChecked = useOximetryCapture
+        oximetrySwitch.setOnCheckedChangeListener { _, checked ->
+            if (checked == useOximetryCapture) return@setOnCheckedChangeListener
+            useOximetryCapture = checked
+            // An exposure/tone-curve change is a step in every channel; clear
+            // the window so HR/SpO2/morphology restart on consistent data.
+            signalBuffer.clear()
+            hrDisplaySmoother.reset()
+            bindUseCases()
+        }
+        recordButton.setOnClickListener { if (recorder.isRecording) stopRecording() else startRecording() }
+        findViewById<Button>(R.id.holdStartButton).setOnClickListener { markEvent(CalibrationCsvFormat.Event.BREATH_HOLD_START) }
+        findViewById<Button>(R.id.holdEndButton).setOnClickListener { markEvent(CalibrationCsvFormat.Event.BREATH_HOLD_END) }
+        findViewById<Button>(R.id.noteButton).setOnClickListener { markEvent(CalibrationCsvFormat.Event.NOTE) }
+        findViewById<Button>(R.id.zeroLightButton).setOnClickListener { runZeroLightMeasurement() }
+    }
+
+    /** "Now" on the same clock as the frame rows' sensor timestamps: the
+     *  elapsedRealtime clock directly when the sensor timestamp source is
+     *  REALTIME, otherwise extrapolated from the last frame's receipt. */
+    private fun nowOnSensorClockNs(): Long {
+        val nowElapsed = SystemClock.elapsedRealtimeNanos()
+        if (cameraCapabilities?.timestampSourceRealtime == true || lastFrameSensorNs == 0L) return nowElapsed
+        return lastFrameSensorNs + (nowElapsed - lastFrameReceiptElapsedNs)
+    }
+
+    private fun startRecording() {
+        if (useOximetryCapture && oximetry.lockState != LockState.LOCKED) {
+            Toast.makeText(this, "Camera not locked yet (${oximetry.lockState}) - recording anyway; see lock_state column", Toast.LENGTH_LONG).show()
+        }
+        recordStartSensorNs = nowOnSensorClockNs()
+        recordStartElapsedNs = SystemClock.elapsedRealtimeNanos()
+        val file = recorder.start(calibrationHeader())
+        recordButton.text = getString(R.string.cal_record_stop)
+        oximetrySwitch.isEnabled = false
+        lightingInput.isEnabled = false
+        startElapsedTicker()
+        Toast.makeText(this, "Recording to ${file.name}", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun stopRecording() {
+        flushPendingRows(force = true)
+        recorder.stop()
+        recordButton.text = getString(R.string.cal_record_start)
+        oximetrySwitch.isEnabled = true
+        lightingInput.isEnabled = true
+        Toast.makeText(this, "Saved ${recorder.file?.name}", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun markEvent(event: CalibrationCsvFormat.Event) {
+        if (!recorder.isRecording) {
+            Toast.makeText(this, "Not recording", Toast.LENGTH_SHORT).show()
+            return
+        }
+        recorder.writeEvent(nowOnSensorClockNs(), event)
+        Toast.makeText(this, "${event.label} @ ${elapsedText.text}", Toast.LENGTH_SHORT).show()
+    }
+
+    private val elapsedTicker = object : Runnable {
+        override fun run() {
+            if (!recorder.isRecording) return
+            flushPendingRows(force = false)
+            val ms = (SystemClock.elapsedRealtimeNanos() - recordStartElapsedNs) / 1_000_000L
+            elapsedText.text = String.format(Locale.US, "%02d:%02d.%d", ms / 60_000, (ms / 1000) % 60, (ms / 100) % 10)
+            uiHandler.postDelayed(this, 100L)
+        }
+    }
+
+    private fun startElapsedTicker() {
+        uiHandler.removeCallbacks(elapsedTicker)
+        uiHandler.post(elapsedTicker)
+    }
+
+    /** Rows waiting for their frame's TotalCaptureResult, oldest first. On
+     *  skipped-detection frames the ROI sample can reach the main thread
+     *  before the camera delivers that frame's capture result (measured on
+     *  the A35: 21-32 % of rows had no metadata when written immediately), so
+     *  each row is held up to [ROW_META_WAIT_MS], in order, and written with
+     *  whatever metadata exists by then. */
+    private val pendingRows = ArrayDeque<Pair<CalibrationCsvFormat.FrameRow, Long>>()
+
+    private fun writeCalibrationRow(result: FaceAnalysisResult.FaceDetected, s: RgbSample) {
+        val roi = result.roiBoxRotated
+        val row = CalibrationCsvFormat.FrameRow(
+            timestampNs = result.sensorTimestampNs,
+            rMean = s.red.toDouble(), gMean = s.green.toDouble(), bMean = s.blue.toDouble(),
+            clippedPx = s.clippedPixels,
+            roiLeft = roi.left, roiTop = roi.top, roiRight = roi.right, roiBottom = roi.bottom,
+            exposureNs = null, iso = null, aeState = null, awbState = null,
+            hrBpm = lastHrBpm, spo2Displayed = lastSpo2,
+            piRed = spo2Estimator.lastPerfusionIndexRed, piBlue = spo2Estimator.lastPerfusionIndexBlue,
+            sampledPx = s.sampledPixels,
+            elapsedMs = (result.sensorTimestampNs - recordStartSensorNs) / 1_000_000L,
+            lockState = if (useOximetryCapture) oximetry.lockState.name else "AUTO",
+            tonemapMode = null
+        )
+        pendingRows.addLast(row to SystemClock.elapsedRealtime())
+        flushPendingRows(force = false)
+    }
+
+    private fun flushPendingRows(force: Boolean) {
+        val now = SystemClock.elapsedRealtime()
+        while (pendingRows.isNotEmpty()) {
+            val (row, queuedAt) = pendingRows.first()
+            val meta = oximetry.metaFor(row.timestampNs)
+            if (meta == null && !force && now - queuedAt < ROW_META_WAIT_MS) return
+            pendingRows.removeFirst()
+            recorder.writeFrame(
+                row.copy(
+                    exposureNs = meta?.exposureNs, iso = meta?.iso,
+                    aeState = meta?.aeState, awbState = meta?.awbState,
+                    tonemapMode = meta?.tonemapMode
+                )
+            )
+        }
+    }
+
+    private fun calibrationHeader(): List<Pair<String, String>> {
+        val caps = cameraCapabilities
+        val meta = oximetry.latestMeta
+        val versionName = try { packageManager.getPackageInfo(packageName, 0).versionName ?: "?" } catch (e: Exception) { "?" }
+        val activeMode = if (!useOximetryCapture) "AUTO (oximetry capture off)" else caps?.plan?.branch?.name ?: "unknown"
+        val linearActive = useOximetryCapture && caps?.plan?.linearToneCurve == true
+        val isBranchA = useOximetryCapture && caps?.plan?.branch == OximetryMath.CaptureBranch.A_MANUAL
+        return listOf(
+            "spandan_calibration_csv" to "schema_version=${CalibrationCsvFormat.SCHEMA_VERSION}",
+            "app_version" to versionName,
+            "recording_start_wallclock" to SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", Locale.US).format(Date()),
+            "recording_start_timestamp_ns" to recordStartSensorNs.toString(),
+            "timestamp_source" to (if (caps?.timestampSourceRealtime == true) "REALTIME (elapsedRealtimeNanos)" else "UNKNOWN (event rows extrapolated from last frame)"),
+            "phone_manufacturer" to Build.MANUFACTURER,
+            "phone_model" to Build.MODEL,
+            "phone_device" to Build.DEVICE,
+            "android_release" to "${Build.VERSION.RELEASE} (sdk ${Build.VERSION.SDK_INT})",
+            "camera_id" to (caps?.cameraId ?: "?"),
+            "camera_hardware_level" to (caps?.hardwareLevel ?: "?"),
+            "camera_capability_branch" to (caps?.plan?.branch?.name ?: "?"),
+            "active_capture_mode" to activeMode,
+            "linear_tone_curve_active" to linearActive.toString(),
+            "lock_state_at_start" to (if (useOximetryCapture) oximetry.lockState.name else "AUTO"),
+            "lock_note" to oximetry.lockNote,
+            "requested_exposure_ns" to (oximetry.requestedSetting?.exposureNs?.toString() ?: ""),
+            "requested_iso" to (oximetry.requestedSetting?.iso?.toString() ?: ""),
+            "requested_ae_compensation" to (if (useOximetryCapture) "${oximetry.requestedAeCompensation} steps x ${caps?.aeCompensationStepEv} EV" else ""),
+            "applied_exposure_ns_at_start" to (meta?.exposureNs?.toString() ?: ""),
+            "applied_iso_at_start" to (meta?.iso?.toString() ?: ""),
+            "applied_color_gains_rggb_at_start" to OximetryCaptureController.gainsText(meta?.gains),
+            "applied_tonemap_mode_at_start" to CameraCapabilityProbe.toneMapName(meta?.tonemapMode),
+            "roi_brightest_fraction_at_lock" to (oximetry.lockedBrightestFraction?.let { String.format(Locale.US, "%.3f", it) } ?: ""),
+            "fps_range" to (if (useOximetryCapture) caps?.chosenFpsRange()?.asText() ?: "?" else "auto (CameraX default)"),
+            "sensor_frame_duration_ns_requested" to (if (isBranchA) oximetry.frameDurationNs().toString() else ""),
+            "zero_light_offset" to ZeroLightOffset.describe(),
+            "zero_light_last_measured_this_session" to zeroLightNote,
+            "lighting_condition" to lightingInput.text.toString().ifBlank { "(not entered)" },
+            "rgb_values" to "raw 8-bit ROI means; BT.601 from YUV_420_888; stride-2 sampled; zero-light offset NOT subtracted",
+            "clip_threshold" to "any channel >= ${OximetryMath.CLIP_THRESHOLD.toInt()} (clipped_px of sampled_px)",
+            "roi_coordinates" to "upright (rotated) analysis frame ${lastRotatedWidth}x$lastRotatedHeight px",
+            "hr_spo2_columns" to "latest displayed values (1 Hz recompute); spo2 formula unchanged: 96.476+0.416*R",
+            "event_rows" to "first field EVENT then timestamp_ns then breath_hold_start|breath_hold_end|note (a note may carry a 4th text field)",
+            "elapsed_ms" to "sensor time since the Start tap; the first few rows are slightly negative (frames exposed before the tap; about 100-150 ms pipeline latency)"
+        )
+    }
+
+    /** Task 3: cover the front camera, measure 5 s of dark frames under the
+     *  current LOCKED settings, log the mean R/G/B (SPANDAN_ZERO_LIGHT). */
+    private fun runZeroLightMeasurement() {
+        if (!useOximetryCapture || oximetry.lockState != LockState.LOCKED) {
+            Toast.makeText(this, "Turn on locked/linear capture and wait for LOCKED first", Toast.LENGTH_LONG).show()
+            return
+        }
+        Toast.makeText(this, "Cover the front camera now - measuring in 3 s for 5 s", Toast.LENGTH_LONG).show()
+        uiHandler.postDelayed({
+            zeroLightMeter.start()
+            uiHandler.postDelayed({
+                val r = zeroLightMeter.stop()
+                val meta = oximetry.latestMeta
+                zeroLightNote = String.format(
+                    Locale.US, "R=%.3f;G=%.3f;B=%.3f;frames=%d;exposure_ns=%s;iso=%s",
+                    r.red, r.green, r.blue, r.frames, meta?.exposureNs, meta?.iso
+                )
+                Log.i(ZERO_LIGHT_TAG, "model=${Build.MANUFACTURER} ${Build.MODEL} state=${oximetry.lockState} $zeroLightNote")
+                if (recorder.isRecording) recorder.writeEvent(nowOnSensorClockNs(), CalibrationCsvFormat.Event.NOTE, "zero_light $zeroLightNote")
+                Toast.makeText(this, "Zero-light: $zeroLightNote", Toast.LENGTH_LONG).show()
+            }, 5000L)
+        }, 3000L)
     }
 
     /** Periodically refreshes the chart + HR text, decoupled from the camera
@@ -283,6 +570,7 @@ class MainActivity : AppCompatActivity() {
         // pure passthrough (DisplaySmoother.Mode.NONE-equivalent), so hrBpm
         // is byte-for-byte hrRaw unless explicitly enabled.
         val hrBpm = if (enableHrDisplaySmoothing) hrDisplaySmoother.smooth(hrRaw) else hrRaw
+        lastHrBpm = hrBpm
         hrText.text = if (hrBpm != null) {
             getString(R.string.hr_format, hrBpm)
         } else {
@@ -297,6 +585,7 @@ class MainActivity : AppCompatActivity() {
         // signal/LiveSpo2Estimator.kt. Independent call on the same samples
         // snapshot -- does not read heartRateEstimator's state or vice versa.
         val spo2 = spo2Estimator.update(samples)
+        lastSpo2 = spo2
         spo2Text.text = if (spo2 != null) {
             getString(R.string.spo2_format, spo2)
         } else {
@@ -316,6 +605,16 @@ class MainActivity : AppCompatActivity() {
         // averaged beat; see WaveformView's own KDoc for why.
         morphologyWaveformView.update(morphologyEstimate?.continuousWaveform)
         applyMorphologyStatusPill(noFaceSustained, morphologyEstimator.lastStatus, morphologyEstimate)
+
+        // [Segment 34] developer panel status (only while it is visible).
+        if (calibrationPanel.visibility == View.VISIBLE) {
+            val last = samples.lastOrNull()
+            val clip = if (last != null && last.sampledPixels > 0) " clip=${last.clippedPixels}/${last.sampledPixels}" else ""
+            val rgb = if (last != null) String.format(Locale.US, " RGB=%.0f/%.0f/%.0f", last.red, last.green, last.blue) else ""
+            val rec = if (recorder.isRecording) " REC ${recorder.rowsWritten} rows" else ""
+            val zero = if (zeroLightNote.isNotEmpty()) "\nzero-light $zeroLightNote" else ""
+            oximetryStatusText.text = oximetry.statusLine() + rgb + clip + rec + zero
+        }
     }
 
     /**
@@ -374,6 +673,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        if (::recorder.isInitialized) recorder.shutdown()
         analysisExecutor.shutdown()
         uiHandler.removeCallbacksAndMessages(null)
     }
@@ -412,5 +712,17 @@ class MainActivity : AppCompatActivity() {
          *  the numeric confidence itself is always shown regardless of
          *  which side of this bar it falls on. */
         private const val MORPHOLOGY_CONFIDENCE_BAR = 0.3
+
+        /** [Segment 34] OFF by default: locked exposure/ISO/white balance +
+         *  linear tone curve for oximetry-grade RGB (Xuan et al. 2023). Not
+         *  promoted until HR is shown not to be worse with it on -- see
+         *  docs/Segment34_SpO2_Oximetry_Capture.md. Switchable at runtime from
+         *  the developer calibration panel (long-press the vitals card). */
+        private const val USE_OXIMETRY_CAPTURE_DEFAULT = false
+
+        private const val ZERO_LIGHT_TAG = "SPANDAN_ZERO_LIGHT"
+
+        /** How long a calibration row may wait for its frame's capture result. */
+        private const val ROW_META_WAIT_MS = 300L
     }
 }

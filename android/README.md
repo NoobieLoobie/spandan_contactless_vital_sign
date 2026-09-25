@@ -1140,3 +1140,31 @@ ABPF/Gaussian confidence-gate substitution fired for real on that capture (6/9 w
 substituted, 3/9 stayed on ABPF), not just in a unit test. Branch 1 (HR/SpO2) confirmed
 unaffected on the exact same capture. Full detail, real numbers, and every flagged
 ambiguity: [`docs/Segment19_Branch2_Morphology_Port.md`](docs/Segment19_Branch2_Morphology_Port.md).
+
+## Segment 34 -- oximetry-grade (locked, linear) capture + calibration recorder
+
+Run 2026-09-25, same Galaxy A35. Implements the acquisition half of the Segment 33 SpO2
+redesign (`../matlab/docs/Segment33_SpO2_Research_and_New_Pipeline.md`). **The displayed
+SpO2 formula is unchanged.** New package `oximetry/`: a capability probe (logcat
+`SPANDAN_CAPS`), a CameraX `Camera2Interop` controller that pre-rolls in auto mode,
+meters the forehead ROI to 40-60 % of full scale, then locks the camera (logcat
+`SPANDAN_OXI`, with what the HAL *actually* applied), a zero-light (dark offset) meter,
+and a per-frame calibration CSV recorder with breath-hold event markers.
+
+- **Branch B on the A35** (front camera is `LIMITED`: no manual sensor/post-processing),
+  but it honours AE/AWB lock, a fixed 30 fps range and a **linear `CONTRAST_CURVE`** tone
+  map, all confirmed from `TotalCaptureResult` readback.
+- **Gated, off by default** (`USE_OXIMETRY_CAPTURE_DEFAULT = false` in `MainActivity`).
+  Turn it on at runtime from the developer panel: **long-press the HEART RATE / BLOOD
+  OXYGEN card**. The same panel has Start/Stop rec, Hold start/Hold end/Mark, a
+  lighting-condition field, Zero-light 5 s, and a large elapsed-time counter.
+- CSVs go to `/sdcard/Android/data/com.spandan.app/files/calibration/`; get them with
+  `adb pull /sdcard/Android/data/com.spandan.app/files/calibration/`. No video is stored.
+- HR regression (bracketed auto/locked/auto/locked, same person, pulse-oximeter PR as
+  reference): locked mode was **not worse, and better here** (HR MAE 5.5-7.1 vs 12.0-13.8
+  bpm, 29 vs 19-24 fps). It is still not promoted to default: the gain is confounded with
+  frame rate, n = 1, and there is no re-lock logic yet.
+- 83/83 unit tests pass (18 new).
+
+Full detail, the capability table, the CSV schema and the known limitations:
+[`docs/Segment34_SpO2_Oximetry_Capture.md`](docs/Segment34_SpO2_Oximetry_Capture.md).

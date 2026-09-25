@@ -19,7 +19,12 @@ sealed class FaceAnalysisResult {
         val roiBoxRotated: Rect,
         val rotatedImageWidth: Int,
         val rotatedImageHeight: Int,
-        val rgbSample: RgbSample?
+        val rgbSample: RgbSample?,
+        /** [Segment 34] the frame's sensor timestamp (ImageInfo.getTimestamp,
+         *  same clock/value as the matching TotalCaptureResult's
+         *  SENSOR_TIMESTAMP), so per-frame camera metadata can be joined to
+         *  this ROI sample. 0 where a caller does not supply it. */
+        val sensorTimestampNs: Long = 0L
     ) : FaceAnalysisResult()
 }
 
@@ -363,7 +368,8 @@ class FaceAnalyzer(
                 roiBoxRotated = roiBoxRotated,
                 rotatedImageWidth = rotatedImageWidth,
                 rotatedImageHeight = rotatedImageHeight,
-                rgbSample = rgbSample
+                rgbSample = rgbSample,
+                sensorTimestampNs = imageProxy.imageInfo.timestamp
             )
         )
     }

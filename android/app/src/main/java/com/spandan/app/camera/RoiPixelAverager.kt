@@ -3,6 +3,7 @@ package com.spandan.app.camera
 import android.graphics.Rect
 import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageProxy
+import com.spandan.app.oximetry.OximetryMath
 import com.spandan.app.signal.RgbSample
 
 /**
@@ -47,6 +48,7 @@ object RoiPixelAverager {
         var sumG = 0L
         var sumB = 0L
         var count = 0
+        var clipped = 0
 
         var y = top
         while (y < bottom) {
@@ -71,6 +73,9 @@ object RoiPixelAverager {
                     sumR += r.coerceIn(0.0, 255.0).toLong()
                     sumG += g.coerceIn(0.0, 255.0).toLong()
                     sumB += b.coerceIn(0.0, 255.0).toLong()
+                    // [Segment 34] clipped-pixel count for the oximetry
+                    // capture mode's exposure check / calibration CSV.
+                    if (OximetryMath.isClipped(r, g, b)) clipped++
                     count++
                 }
                 x += SAMPLE_STRIDE
@@ -83,7 +88,9 @@ object RoiPixelAverager {
             timestampMs = System.currentTimeMillis(),
             red = sumR.toFloat() / count,
             green = sumG.toFloat() / count,
-            blue = sumB.toFloat() / count
+            blue = sumB.toFloat() / count,
+            clippedPixels = clipped,
+            sampledPixels = count
         )
     }
 

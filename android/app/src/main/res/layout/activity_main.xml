@@ -131,6 +131,130 @@
                 android:text="@string/grant_permission" />
         </LinearLayout>
 
+        <!-- [Segment 34] Developer calibration panel (hidden by default;
+             long-press the vitals card to show/hide). Holds the oximetry-
+             capture toggle, the calibration CSV recorder, breath-hold event
+             markers, the zero-light offset action, and a big elapsed-time
+             counter so a separately-filmed pulse-oximeter display can be
+             time-aligned with the CSV. See
+             docs/Segment34_SpO2_Oximetry_Capture.md. -->
+        <LinearLayout
+            android:id="@+id/calibrationPanel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top"
+            android:orientation="vertical"
+            android:background="#D9000000"
+            android:padding="10dp"
+            android:visibility="gone"
+            tools:visibility="visible">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
+
+                <TextView
+                    android:id="@+id/elapsedText"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:fontFamily="monospace"
+                    android:text="@string/cal_elapsed_idle"
+                    android:textColor="@color/text_primary"
+                    android:textSize="44sp"
+                    android:textStyle="bold" />
+
+                <androidx.appcompat.widget.SwitchCompat
+                    android:id="@+id/oximetrySwitch"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/cal_oximetry_switch"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="11sp" />
+            </LinearLayout>
+
+            <!-- Fixed 4 lines so the buttons below never move while the
+                 text grows (keeps them at stable screen positions). -->
+            <TextView
+                android:id="@+id/oximetryStatusText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:lines="4"
+                android:ellipsize="end"
+                android:fontFamily="monospace"
+                android:textColor="@color/text_secondary"
+                android:textSize="10sp" />
+
+            <EditText
+                android:id="@+id/lightingInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="@string/cal_lighting_hint"
+                android:importantForAutofill="no"
+                android:inputType="text"
+                android:maxLines="1"
+                android:textColor="@color/text_primary"
+                android:textColorHint="@color/text_tertiary"
+                android:textSize="13sp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/recordButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:layout_marginEnd="4dp"
+                    android:text="@string/cal_record_start"
+                    android:textSize="11sp" />
+
+                <Button
+                    android:id="@+id/holdStartButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:layout_marginEnd="4dp"
+                    android:text="@string/cal_hold_start"
+                    android:textSize="11sp" />
+
+                <Button
+                    android:id="@+id/holdEndButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/cal_hold_end"
+                    android:textSize="11sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/noteButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:layout_marginEnd="4dp"
+                    android:text="@string/cal_note"
+                    android:textSize="11sp" />
+
+                <Button
+                    android:id="@+id/zeroLightButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/cal_zero_light"
+                    android:textSize="11sp" />
+            </LinearLayout>
+        </LinearLayout>
+
     </FrameLayout>
 
     <!-- Segment 31: the app's ONE primary "LIVE SIGNAL" card — Branch 2's
@@ -200,8 +324,10 @@
         </LinearLayout>
     </LinearLayout>
 
-    <!-- Vitals card -->
+    <!-- Vitals card ([Segment 34] id added: long-press toggles the
+         developer calibration panel) -->
     <LinearLayout
+        android:id="@+id/vitalsCard"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="horizontal"

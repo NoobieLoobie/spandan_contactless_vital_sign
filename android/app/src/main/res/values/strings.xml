@@ -86,4 +86,17 @@
     <string name="morphology_method_abpf">ABPF comb</string>
     <string name="morphology_method_gaussian">Gaussian (α=0.15)</string>
     <string name="morphology_no_notch">No notch detected this window</string>
+
+    <!-- [Segment 34] developer calibration panel (long-press the vitals card).
+         Not user-facing; see docs/Segment34_SpO2_Oximetry_Capture.md. -->
+    <string name="cal_elapsed_idle">--:--.-</string>
+    <string name="cal_oximetry_switch">Locked
+linear</string>
+    <string name="cal_lighting_hint">Lighting (e.g. single desk LED lamp)</string>
+    <string name="cal_record_start">Start rec</string>
+    <string name="cal_record_stop">Stop rec</string>
+    <string name="cal_hold_start">Hold start</string>
+    <string name="cal_hold_end">Hold end</string>
+    <string name="cal_note">Mark</string>
+    <string name="cal_zero_light">Zero-light 5 s</string>
 </resources>
