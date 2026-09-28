@@ -153,4 +153,51 @@ object CoordinateMapper {
             )
         }
     }
+
+    /**
+     * [Segment 35 Phase 3] The mathematical inverse of [rotatedRectToViewRect]:
+     * maps a rect FROM on-screen view pixel coordinates BACK INTO the
+     * rotated-image coordinate space (analysis frames are NOT mirrored, only
+     * PreviewView's own rendering is -- so this undoes both the FIT_CENTER
+     * scale/letterbox AND the front-camera mirror flip [rotatedRectToViewRect]
+     * applies). Used to map [com.spandan.app.oximetry.OximeterGuideBox]'s
+     * fixed view-space guide rectangle back to a rotated-space rect
+     * ([rotatedRectToSensorRect] then takes it the rest of the way to sensor
+     * space for the actual pixel crop). Solved by hand from
+     * [rotatedRectToViewRect]'s own equations (front-camera branch: for each
+     * output edge, invert `view = offset + (srcWidth - rect) * scale` /
+     * `view = offset + rect * scale`) -- verified by a round-trip property
+     * test ([CoordinateMapperTest]: forward then inverse returns the
+     * original rect, for random rects/dimensions), same discipline as
+     * [sensorRectToRotatedRect]'s own round-trip test, since no physical
+     * device was available this session to verify it any other way.
+     */
+    fun viewRectToRotatedRect(
+        rect: RectF,
+        srcWidth: Int,
+        srcHeight: Int,
+        viewWidth: Int,
+        viewHeight: Int,
+        isFrontCamera: Boolean
+    ): Rect {
+        if (srcWidth <= 0 || srcHeight <= 0 || viewWidth <= 0 || viewHeight <= 0) return Rect()
+
+        val scale = minOf(viewWidth.toFloat() / srcWidth, viewHeight.toFloat() / srcHeight)
+        val offsetX = (viewWidth - srcWidth * scale) / 2f
+        val offsetY = (viewHeight - srcHeight * scale) / 2f
+        if (scale <= 0f) return Rect()
+
+        val top = (rect.top - offsetY) / scale
+        val bottom = (rect.bottom - offsetY) / scale
+
+        return if (isFrontCamera) {
+            val right = srcWidth - (rect.left - offsetX) / scale
+            val left = srcWidth - (rect.right - offsetX) / scale
+            Rect(left.toInt(), top.toInt(), right.toInt(), bottom.toInt())
+        } else {
+            val left = (rect.left - offsetX) / scale
+            val right = (rect.right - offsetX) / scale
+            Rect(left.toInt(), top.toInt(), right.toInt(), bottom.toInt())
+        }
+    }
 }

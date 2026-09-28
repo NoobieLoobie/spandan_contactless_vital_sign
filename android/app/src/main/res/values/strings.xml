@@ -60,6 +60,12 @@
     <string name="status_no_face">No face detected</string>
     <string name="no_face_banner_title">No face detected</string>
     <string name="no_face_banner_subtitle">Center your face in frame, hold still, and make sure your forehead is well lit.</string>
+    <!-- [Segment 35 Phase 2 item 2]: shown instead of the two strings above
+         when a real lost-face gap (SignalBuffer.isReacquiring) was just
+         detected and the HR/SpO2 window was cleared, rather than spliced
+         across the gap. -->
+    <string name="reacquiring_banner_title">Re-acquiring signal…</string>
+    <string name="reacquiring_banner_subtitle">Your face was briefly lost. Hold still — HR/SpO2 will resume once enough fresh data is collected.</string>
 
     <!-- Segment 19: Branch 2 (waveform morphology / dicrotic notch).
          methodLabel is built in MainActivity (maps
@@ -92,6 +98,10 @@
     <string name="cal_elapsed_idle">--:--.-</string>
     <string name="cal_oximetry_switch">Locked
 linear</string>
+    <!-- [Segment 35 Phase 3] -->
+    <string name="cal_unmirror_switch">Un-mirror
+preview</string>
+    <string name="oximeter_inset_description">Upright, un-mirrored oximeter guide-box crop</string>
     <string name="cal_lighting_hint">Lighting (e.g. single desk LED lamp)</string>
     <string name="cal_record_start">Start rec</string>
     <string name="cal_record_stop">Stop rec</string>

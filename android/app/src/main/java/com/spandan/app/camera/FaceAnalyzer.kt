@@ -16,6 +16,10 @@ sealed class FaceAnalysisResult {
 
     data class FaceDetected(
         val faceBoxRotated: Rect,
+        /** The forehead sub-box -- kept as the single primary ROI field for
+         *  every pre-existing consumer (the calibration CSV's roi_* columns,
+         *  ProfilingFaceAnalyzer.kt's profiling captures). Equals
+         *  [roiBoxesRotated]'s first element. */
         val roiBoxRotated: Rect,
         val rotatedImageWidth: Int,
         val rotatedImageHeight: Int,
@@ -24,7 +28,14 @@ sealed class FaceAnalysisResult {
          *  same clock/value as the matching TotalCaptureResult's
          *  SENSOR_TIMESTAMP), so per-frame camera metadata can be joined to
          *  this ROI sample. 0 where a caller does not supply it. */
-        val sensorTimestampNs: Long = 0L
+        val sensorTimestampNs: Long = 0L,
+        /** [Segment 35 Phase 2 item 4] Every rotated-space region actually
+         *  pooled into [rgbSample] -- the real, live-app forehead+leftCheek+
+         *  rightCheek regions FaceAnalyzer.emitFaceDetected builds. Defaulted
+         *  to a single-element list of [roiBoxRotated] so every pre-existing
+         *  construction site (ProfilingFaceAnalyzer.kt's several profiling
+         *  paths, none of which pool multiple regions) is unchanged. */
+        val roiBoxesRotated: List<Rect> = listOf(roiBoxRotated)
     ) : FaceAnalysisResult()
 }
 
@@ -59,20 +70,30 @@ class FaceAnalyzer(
     private val useCroppedDetection: Boolean = false,
     private val croppedDetectionPaddingFraction: Float = 0.5f,
     private val croppedDetectionDownscaleFactor: Int = 1,
-    /** [Segment 29] PROMOTED TO DEFAULT (0.35, up from ML Kit's own default
-     *  of 0.1) after real on-device measurement (Galaxy A35): cut mean real-
-     *  detection cost ~87-90ms -> ~19-25ms (a ~4x reduction, not a noise-band
-     *  effect -- baseline was bracketed before/after and stayed at ~88-90ms)
-     *  and raised steady-state fps ~18.5-19 -> ~23.7-23.84, with 0-1 missed-
-     *  face frames out of ~1000 at both normal and increased camera distance.
-     *  Google's own docs note a larger value lets the detector skip pyramid
-     *  levels and run faster, at the cost of missing smaller/more distant
-     *  faces -- this project's own measurement above is the evidence that
-     *  cost is acceptable at 0.35 for this app's expected usage distance,
-     *  not just Google's general guidance taken on faith. See
-     *  android/docs/Segment29_MinFaceSize_And_Kalman.md for the full capture
-     *  data and caveats (distance range was NOT exhaustively swept). */
-    private val minFaceSize: Float = 0.35f,
+    /** [Segment 29] 0.35 (up from ML Kit's own default of 0.1) was promoted
+     *  after real on-device measurement (Galaxy A35): cut mean real-detection
+     *  cost ~87-90ms -> ~19-25ms and raised steady-state fps ~18.5-19 ->
+     *  ~23.7-23.84, with 0-1 missed-face frames out of ~1000 -- but Segment
+     *  29's distance sweep was "normal distance" plus ONE "increased distance"
+     *  framing, both with the phone on a stand at a faired setup. It never
+     *  tested handheld arm's-length framing, where the face fills a smaller
+     *  fraction of a 640x480 analysis frame than either Segment 29 setup did.
+     *
+     *  [Segment 35 Phase 2 item 1] CANDIDATE, NOT ON-DEVICE VALIDATED THIS
+     *  SESSION (no physical device available) -- lowered to 0.18, the middle
+     *  of docs/Segment35_Accuracy_Research_and_Plan.md's own requested
+     *  0.15-0.20 range, on the reasoning that a smaller value only costs
+     *  detector speed (Segment 29's own finding: the win from 0.1->0.35 was
+     *  entirely a pyramid-level/speed effect, not an accuracy one), and
+     *  Segment 18/28's every-Nth-frame detection skip already amortizes that
+     *  per-detection cost across DETECT_EVERY_N_FRAMES frames. This is
+     *  exactly the kind of change this project's own standing discipline
+     *  says NOT to lock in on reasoning alone -- Phase 4 (on-device, real
+     *  handheld framing) MUST re-measure missed-face % and fps at this value
+     *  before it is treated as validated; 0.35 remains one bracket point to
+     *  re-test alongside it, not something this change claims to have beaten.
+     *  See android/docs/SegmentXX_Android_Fix_Pack.md. */
+    private val minFaceSize: Float = 0.18f,
     /** [Segment 29] PROMOTED TO DEFAULT after real on-device measurement:
      *  effectively free (mean predict() cost 0.03-0.04ms, max ~3ms across
      *  two captures -- even cheaper than [OpticalFlowFaceTracker]'s SAD
@@ -346,7 +367,23 @@ class FaceAnalyzer(
 
     /** Shared ROI/coordinate-mapping/averaging tail for both a fresh detection
      *  and a reused (skipped-detection) face box -- identical math either
-     *  way, just a different source for [faceBoxRotated]. */
+     *  way, just a different source for [faceBoxRotated].
+     *
+     *  [Segment 35 Phase 2 item 4] Pools forehead + both cheeks (
+     *  [RoiCalculator.cheekRoisFrom], the SAME geometry the Field Guide
+     *  Action 1 feasibility pilot already measured as ~free on-device --
+     *  see MultiRegionProfilingFaceAnalyzer.kt's own header) into ONE
+     *  [RgbSample] via [RoiPixelAverager.averageRgbMultiRect], instead of
+     *  the forehead box alone. Phase 1's landmark-driven anatomy ROI
+     *  (matlab/src/roi/faceMeshAnatomyROIExtraction.m) is MATLAB-only this
+     *  session -- per the plan's own fallback instruction, this uses
+     *  [RoiCalculator.cheekRoisFrom]'s existing face-box-fraction geometry
+     *  rather than porting a MediaPipe landmark detector to Android, which
+     *  Segment 30 already found costly and which is out of this phase's
+     *  scope regardless. [FaceAnalysisResult.FaceDetected.roiBoxRotated]
+     *  stays the forehead sub-box alone (the primary/first region) for
+     *  every pre-existing consumer; [FaceAnalysisResult.FaceDetected.roiBoxesRotated]
+     *  carries all three. */
     @ExperimentalGetImage
     private fun emitFaceDetected(
         faceBoxRotated: Rect,
@@ -355,21 +392,24 @@ class FaceAnalyzer(
         rotatedImageHeight: Int,
         imageProxy: ImageProxy
     ) {
-        val roiBoxRotated = RoiCalculator.foreheadRoiFrom(faceBoxRotated)
+        val foreheadBoxRotated = RoiCalculator.foreheadRoiFrom(faceBoxRotated)
+        val (cheekLeftRotated, cheekRightRotated) = RoiCalculator.cheekRoisFrom(faceBoxRotated)
+        val roiBoxesRotated = listOf(foreheadBoxRotated, cheekLeftRotated, cheekRightRotated)
 
-        val roiBoxSensor = CoordinateMapper.rotatedRectToSensorRect(
-            roiBoxRotated, rotationDegrees, imageProxy.width, imageProxy.height
-        )
-        val rgbSample = RoiPixelAverager.averageRgb(imageProxy, roiBoxSensor)
+        val roiBoxesSensor = roiBoxesRotated.map { rect ->
+            CoordinateMapper.rotatedRectToSensorRect(rect, rotationDegrees, imageProxy.width, imageProxy.height)
+        }
+        val rgbSample = RoiPixelAverager.averageRgbMultiRect(imageProxy, roiBoxesSensor)
 
         onResult(
             FaceAnalysisResult.FaceDetected(
                 faceBoxRotated = faceBoxRotated,
-                roiBoxRotated = roiBoxRotated,
+                roiBoxRotated = foreheadBoxRotated,
                 rotatedImageWidth = rotatedImageWidth,
                 rotatedImageHeight = rotatedImageHeight,
                 rgbSample = rgbSample,
-                sensorTimestampNs = imageProxy.imageInfo.timestamp
+                sensorTimestampNs = imageProxy.imageInfo.timestamp,
+                roiBoxesRotated = roiBoxesRotated
             )
         )
     }

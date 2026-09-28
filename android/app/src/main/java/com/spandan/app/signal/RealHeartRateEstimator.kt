@@ -81,19 +81,40 @@ class RealHeartRateEstimator(
             return cached?.displayedBpm
         }
 
-        // Runtime-measured fs from real sample timestamps -- never hardcoded, same
-        // discipline as bandpassClean.m/fftHeartRate.m's own "frameRate must not be
-        // hardcoded" notes, since on-device camera fps varies by device/lighting.
-        val fs = (samples.size - 1) / windowSeconds
+        // [Segment 35 Phase 2 item 3] Resample onto a uniform 30Hz grid using
+        // each sample's REAL sensor timestamp before any filtering -- fixes
+        // finding H3 (every-3rd-frame timing jitter from the async ML Kit
+        // callback biasing the naive `(N-1)/windowSeconds` fs estimate). Falls
+        // back to that naive estimate (fs from wall-clock samples, exactly
+        // this project's pre-Segment-35 behavior) when real per-sample sensor
+        // timestamps aren't available -- see ResampleUniform.resampleRgbSamples's
+        // own KDoc for the exact fallback condition (every existing unit test
+        // below hits this fallback, since none of them set RgbSample.sensorTimestampNs).
+        val resampled = ResampleUniform.resampleRgbSamples(samples)
+        val fs: Double
+        var rawR: DoubleArray
+        var rawG: DoubleArray
+        var rawB: DoubleArray
+        if (resampled != null) {
+            fs = resampled.fs
+            rawR = resampled.r
+            rawG = resampled.g
+            rawB = resampled.b
+        } else {
+            // Runtime-measured fs from real sample timestamps -- never hardcoded, same
+            // discipline as bandpassClean.m/fftHeartRate.m's own "frameRate must not be
+            // hardcoded" notes, since on-device camera fps varies by device/lighting.
+            fs = (samples.size - 1) / windowSeconds
+            rawR = DoubleArray(samples.size) { samples[it].red.toDouble() }
+            rawG = DoubleArray(samples.size) { samples[it].green.toDouble() }
+            rawB = DoubleArray(samples.size) { samples[it].blue.toDouble() }
+        }
+
         if (fs <= 2.0 * HeartRateFft.HIGH_BAND_HZ) {
             Log.w(TAG, "Measured fs=$fs Hz too low for the 0.7-4Hz band; skipping this window")
             lastStatus = EstimatorStatus.LOW_SIGNAL_QUALITY
             return cached?.displayedBpm
         }
-
-        var rawR = DoubleArray(samples.size) { samples[it].red.toDouble() }
-        var rawG = DoubleArray(samples.size) { samples[it].green.toDouble() }
-        var rawB = DoubleArray(samples.size) { samples[it].blue.toDouble() }
 
         // [2026-09-13] PROMOTED TO DEFAULT, matching the MATLAB pipeline's own
         // scripts/run_segment3_filtering_batch.m / run_vipl_integration_batch.m
@@ -142,9 +163,9 @@ class RealHeartRateEstimator(
 
         Log.d(
             TAG,
-            ("fs=%.2fHz n=%d window=%.1fs  HR_chrom=%.1fbpm  HR_pos=%.1fbpm  (delta=%.1fbpm)  " +
+            ("fs=%.2fHz n=%d (raw=%d) resampled=%b window=%.1fs  HR_chrom=%.1fbpm  HR_pos=%.1fbpm  (delta=%.1fbpm)  " +
                 "relative_disagreement=%.2f%%  displayed=%s (%.1fbpm)").format(
-                fs, samples.size, windowSeconds, chromResult.bpm, posResult.bpm,
+                fs, rawR.size, samples.size, resampled != null, windowSeconds, chromResult.bpm, posResult.bpm,
                 chromResult.bpm - posResult.bpm, relativeDisagreement * 100.0,
                 if (usedPos) "POS" else "CHROM", displayedBpm
             )

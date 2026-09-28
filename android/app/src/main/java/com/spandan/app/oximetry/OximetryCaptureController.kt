@@ -114,6 +114,15 @@ class OximetryCaptureController {
     @Volatile var latestMeta: FrameMeta? = null
         private set
 
+    /** [Segment 35 Phase 2 item 5] Called (main thread) every time this
+     *  controller starts a RE-lock (brightness drift, or a face reacquired
+     *  after loss) -- MainActivity wires this to clear the HR/SpO2 signal
+     *  buffer, since an exposure step hits every channel at once and the
+     *  window must not mix pre-relock and post-relock samples. Never called
+     *  for the FIRST lock (onCameraBound's own preroll->metering->lock
+     *  path) -- only for a re-lock of an already-LOCKED session. */
+    var onRelock: (() -> Unit)? = null
+
     private val recentMeta = ArrayDeque<FrameMeta>()
     private var control: Camera2CameraControl? = null
     private var enabled = false
@@ -194,8 +203,30 @@ class OximetryCaptureController {
         mainHandler.postDelayed(::finishPreroll, PREROLL_MS)
     }
 
-    /** Feed each ROI sample (main thread). Used only while METERING. */
+    /** [Segment 35 Phase 2 item 5] Call (main thread) when the face analyzer
+     *  reports a real re-acquisition after a lost-face gap (see
+     *  SignalBuffer.isReacquiring, which is what MainActivity's caller
+     *  actually watches). A no-op unless currently LOCKED -- losing and
+     *  regaining the face during PREROLL/METERING/AUTO/UNSUPPORTED needs no
+     *  re-lock, there is no existing lock to have drifted. */
+    fun onFaceReacquired() {
+        if (lockState == LockState.LOCKED) startRelock("face reacquired after a lost-face gap")
+    }
+
+    /** Feed each ROI sample (main thread). Drift-checks while LOCKED
+     *  ([Segment 35 Phase 2 item 5]); otherwise used only while METERING. */
     fun onRoiSample(sensorTimestampNs: Long, r: Double, g: Double, b: Double) {
+        if (lockState == LockState.LOCKED) {
+            val locked = lockedBrightestFraction
+            if (locked != null && locked > 0.0) {
+                val current = OximetryMath.brightestChannelFraction(r, g, b)
+                if (abs(current - locked) / locked > RELOCK_DRIFT_FRACTION) {
+                    startRelock("ROI brightness drifted %.0f%% -> %.0f%% of full scale (>%.0f%% from locked baseline)"
+                        .format(locked * 100, current * 100, RELOCK_DRIFT_FRACTION * 100))
+                }
+            }
+            return
+        }
         if (lockState != LockState.METERING) return
         if (capabilities?.plan?.branch == CaptureBranch.B_LOCK) {
             onRoiSampleBranchB(sensorTimestampNs, r, g, b)
@@ -417,9 +448,40 @@ class OximetryCaptureController {
         b.setCaptureRequestOption(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
     }
 
+    /** [Segment 35 Phase 2 item 5] Re-enters METERING from an existing LOCK,
+     *  reusing the SAME metering state machine [onRoiSample]/
+     *  [onRoiSampleBranchB] already drive to completion (which calls
+     *  [finishLock] again when it settles) -- not a separate code path. Only
+     *  called when [lockState] is already LOCKED (both call sites check
+     *  this), so it can never race the initial preroll->metering->lock
+     *  sequence in [onCameraBound]/[finishPreroll]. */
+    private fun startRelock(reason: String) {
+        val caps = capabilities ?: return
+        Log.i(TAG, "RELOCK triggered: $reason")
+        meteringIteration = 0
+        meteringFractions.clear()
+        meteringPhaseStartMs = SystemClock.elapsedRealtime()
+        if (caps.plan.branch == CaptureBranch.B_LOCK) {
+            // Must unlock AE/AWB first -- exposure/WB compensation changes
+            // have no effect while CONTROL_AE_LOCK/CONTROL_AWB_LOCK are true.
+            applyBranchB(caps, lock = false)
+        }
+        // Branch A needs no new request here: onRoiSample's existing
+        // metering loop keeps correcting from `requestedSetting` (still the
+        // last-applied manual exposure/ISO), the same state it already reads
+        // every METERING tick.
+        setState(LockState.METERING, "RE-METERING: $reason")
+        onRelock?.invoke()
+    }
+
     private fun finishLock(note: String) {
         lockNote = note
         lockedAtMeta = null // reference taken from the first frame that reports the lock in effect
+        // [Segment 35 Phase 2 item 5] reset so a genuine drift after a
+        // RE-lock can still be warned about -- before re-locking existed,
+        // finishLock only ever ran once per session, so this reset was
+        // never reachable/necessary.
+        driftWarned = false
         setState(LockState.LOCKED, note)
     }
 
@@ -513,6 +575,16 @@ class OximetryCaptureController {
         private const val METERING_TIMEOUT_MS = 15_000L
         private const val MAX_METERING_ITERATIONS = 4
         private const val META_HISTORY = 90
+
+        /** [Segment 35 Phase 2 item 5] Re-lock when the ROI's brightest-
+         *  channel fraction drifts by more than this much (relative) from
+         *  [lockedBrightestFraction] -- per docs/Segment35_Accuracy_Research_
+         *  and_Plan.md's own instruction. Not on-device re-tuned this session
+         *  (no physical device available); Phase 4 should check whether 15%
+         *  fires too eagerly (normal head/lighting micro-motion) or too
+         *  rarely (a real lighting change not caught before HR/SpO2 visibly
+         *  degrade) on a real capture. */
+        const val RELOCK_DRIFT_FRACTION = 0.15
 
         fun aeStateName(s: Int?): String = when (s) {
             CaptureResult.CONTROL_AE_STATE_INACTIVE -> "INACTIVE"

@@ -85,6 +85,7 @@
             tools:visibility="visible">
 
             <TextView
+                android:id="@+id/noFaceBannerTitle"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="@string/no_face_banner_title"
@@ -94,6 +95,7 @@
                 android:gravity="center" />
 
             <TextView
+                android:id="@+id/noFaceBannerSubtitle"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="6dp"
@@ -103,6 +105,26 @@
                 android:gravity="center"
                 android:maxWidth="260dp" />
         </LinearLayout>
+
+        <!-- [Segment 35 Phase 3 item 3]: the oximeter guide-box crop, shown
+             upright, un-mirrored, magnified ~2x. Only visible while
+             MainActivity's showOximeterInset is true (tied to the
+             calibration panel, same gate as the guide box itself). Fixed
+             size + a visible border/background so it reads as a distinct
+             "inset" rather than a stray floating image. -->
+        <ImageView
+            android:id="@+id/oximeterInsetImage"
+            android:layout_width="168dp"
+            android:layout_height="112dp"
+            android:layout_gravity="top|end"
+            android:layout_marginTop="12dp"
+            android:layout_marginEnd="12dp"
+            android:background="@color/surface_card"
+            android:padding="2dp"
+            android:scaleType="fitCenter"
+            android:visibility="gone"
+            android:contentDescription="@string/oximeter_inset_description"
+            tools:visibility="visible" />
 
         <!-- Shown only when camera permission is denied; see MainActivity. -->
         <LinearLayout
@@ -174,6 +196,21 @@
                     android:textColor="@color/text_secondary"
                     android:textSize="11sp" />
             </LinearLayout>
+
+            <!-- [Segment 35 Phase 3 item 5]: fallback if the top-right inset
+                 framing is awkward in practice; fully un-mirrors the whole
+                 preview (previewView.scaleX = -1f) instead. Off by default
+                 (the normal selfie-mirrored view). NOTE for on-device UI
+                 automation: this row shifts every button below it down by
+                 one row versus pre-Segment-35 builds; re-measure fixed tap
+                 coordinates. -->
+            <androidx.appcompat.widget.SwitchCompat
+                android:id="@+id/unmirrorPreviewSwitch"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/cal_unmirror_switch"
+                android:textColor="@color/text_secondary"
+                android:textSize="11sp" />
 
             <!-- Fixed 4 lines so the buttons below never move while the
                  text grows (keeps them at stable screen positions). -->

@@ -9,9 +9,11 @@ import android.os.Build
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import android.util.Size
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -22,7 +24,10 @@ import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
@@ -37,6 +42,8 @@ import com.spandan.app.oximetry.CameraCapabilityProbe
 import com.spandan.app.oximetry.OximetryCaptureController
 import com.spandan.app.oximetry.OximetryCaptureController.LockState
 import com.spandan.app.oximetry.OximetryMath
+import com.spandan.app.oximetry.OximeterGuideBox
+import com.spandan.app.oximetry.OximeterInset
 import com.spandan.app.oximetry.ZeroLightMeter
 import com.spandan.app.oximetry.ZeroLightOffset
 import com.spandan.app.oximetry.asText
@@ -72,6 +79,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var spo2Text: TextView
     private lateinit var permissionDeniedView: View
     private lateinit var noFaceBanner: View
+    private lateinit var noFaceBannerTitle: TextView
+    private lateinit var noFaceBannerSubtitle: TextView
     private lateinit var hrStatusDot: View
     private lateinit var hrStatusLabel: TextView
     private lateinit var spo2StatusDot: View
@@ -122,7 +131,13 @@ class MainActivity : AppCompatActivity() {
     // configured exactly as before -- the controller only reads capture
     // results. The displayed SpO2 formula is NOT changed by any of this.
     private var useOximetryCapture = USE_OXIMETRY_CAPTURE_DEFAULT
-    private val oximetry = OximetryCaptureController()
+    private val oximetry = OximetryCaptureController().apply {
+        // [Segment 35 Phase 2 item 5] an exposure/WB step at re-lock hits
+        // every channel at once -- the window must not mix pre-relock and
+        // post-relock samples, same reasoning the oximetrySwitch listener
+        // below already applies when the capture MODE changes.
+        onRelock = { signalBuffer.clear(); hrDisplaySmoother.reset() }
+    }
     private var cameraCapabilities: CameraCapabilityProbe.Capabilities? = null
     private val zeroLightMeter = ZeroLightMeter()
     private lateinit var recorder: CalibrationRecorder
@@ -142,6 +157,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var recordButton: Button
     private var zeroLightNote: String = ""
 
+    // [Segment 35 Phase 3] oximeter viewing box.
+    private lateinit var oximeterInsetImage: ImageView
+    private lateinit var unmirrorPreviewSwitch: SwitchCompat
+    private var lastOximeterInsetUpdateElapsedMs = 0L
+
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             permissionGrantedLastKnown = granted
@@ -158,6 +178,8 @@ class MainActivity : AppCompatActivity() {
         spo2Text = findViewById(R.id.spo2Text)
         permissionDeniedView = findViewById(R.id.permissionDeniedView)
         noFaceBanner = findViewById(R.id.noFaceBanner)
+        noFaceBannerTitle = findViewById(R.id.noFaceBannerTitle)
+        noFaceBannerSubtitle = findViewById(R.id.noFaceBannerSubtitle)
         hrStatusDot = findViewById(R.id.hrStatusDot)
         hrStatusLabel = findViewById(R.id.hrStatusLabel)
         spo2StatusDot = findViewById(R.id.spo2StatusDot)
@@ -259,6 +281,23 @@ class MainActivity : AppCompatActivity() {
         val previewBuilder = Preview.Builder()
         val analysisBuilder = ImageAnalysis.Builder()
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            // [Segment 35 Phase 2 item 4] RGBA_8888 (single interleaved
+            // plane, no YUV->RGB conversion needed downstream -- see
+            // RoiPixelAverager.kt's own header) at 1280x720 (up from
+            // CameraX's own 640x480 default), so a widened forehead+cheeks
+            // ROI still pools a substantial pixel count per region even at
+            // stride 1. FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER: prefer a
+            // resolution >= 1280x720 if the device offers one, otherwise the
+            // closest lower one -- CameraX's own documented default
+            // fallback, kept explicit rather than silently defaulted.
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+            .setResolutionSelector(
+                ResolutionSelector.Builder()
+                    .setResolutionStrategy(
+                        ResolutionStrategy(Size(1280, 720), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)
+                    )
+                    .build()
+            )
         // [Segment 34] read-only capture-result callback always; capture
         // request options only when useOximetryCapture is on.
         oximetry.configure(analysisBuilder, previewBuilder, cameraCapabilities, useOximetryCapture)
@@ -278,6 +317,12 @@ class MainActivity : AppCompatActivity() {
         // zero-light measurement is running.
         analysis.setAnalyzer(analysisExecutor) { imageProxy ->
             zeroLightMeter.offer(imageProxy)
+            // [Segment 35 Phase 3] reads imageProxy.image synchronously,
+            // strictly BEFORE analyzer.analyze(imageProxy) below (whose
+            // async detection paths eventually call imageProxy.close() on a
+            // different thread/callback) -- safe regardless of which of
+            // FaceAnalyzer's several close() call sites ends up firing.
+            offerOximeterGuideCrop(imageProxy)
             analyzer.analyze(imageProxy)
         }
 
@@ -299,9 +344,57 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * [Segment 35 Phase 3 items 2-4] Crops [OximeterGuideBox]'s region out
+     * of this analysis frame, updates the live inset (throttled, main
+     * thread) and -- while recording -- saves it as a JPEG via
+     * [CalibrationRecorder.saveOximeterCrop] (which does its own 1 Hz
+     * throttling). Runs on [analysisExecutor] (this is called from the
+     * `ImageAnalysis.Analyzer` lambda, not the UI thread), gated on the
+     * calibration panel being open -- a debug/calibration feature, not
+     * something every live session should pay the crop cost for.
+     */
+    @ExperimentalGetImage
+    private fun offerOximeterGuideCrop(imageProxy: ImageProxy) {
+        if (calibrationPanel.visibility != View.VISIBLE) return
+        val viewWidth = previewView.width
+        val viewHeight = previewView.height
+        if (viewWidth <= 0 || viewHeight <= 0) return
+
+        val rotationDegrees = imageProxy.imageInfo.rotationDegrees
+        val rotatedWidth: Int
+        val rotatedHeight: Int
+        if (rotationDegrees == 90 || rotationDegrees == 270) {
+            rotatedWidth = imageProxy.height
+            rotatedHeight = imageProxy.width
+        } else {
+            rotatedWidth = imageProxy.width
+            rotatedHeight = imageProxy.height
+        }
+
+        val guideViewRect = OximeterGuideBox.inView(viewWidth, viewHeight)
+        val guideRotatedRect = CoordinateMapper.viewRectToRotatedRect(
+            guideViewRect, rotatedWidth, rotatedHeight, viewWidth, viewHeight, isFrontCamera = true
+        )
+        val guideSensorRect = CoordinateMapper.rotatedRectToSensorRect(
+            guideRotatedRect, rotationDegrees, imageProxy.width, imageProxy.height
+        )
+
+        val crop = OximeterInset.extractUprightCrop(imageProxy, guideSensorRect, rotationDegrees) ?: return
+
+        if (recorder.isRecording) {
+            recorder.saveOximeterCrop(crop, imageProxy.imageInfo.timestamp)
+        }
+
+        val nowElapsed = SystemClock.elapsedRealtime()
+        if (nowElapsed - lastOximeterInsetUpdateElapsedMs < OXIMETER_INSET_UI_UPDATE_INTERVAL_MS) return
+        lastOximeterInsetUpdateElapsedMs = nowElapsed
+        uiHandler.post { oximeterInsetImage.setImageBitmap(crop) }
+    }
+
     private fun handleAnalysisResult(result: FaceAnalysisResult) {
         when (result) {
-            is FaceAnalysisResult.NoFace -> overlayView.update(null, null)
+            is FaceAnalysisResult.NoFace -> overlayView.update(null, emptyList())
 
             is FaceAnalysisResult.FaceDetected -> {
                 lastFaceSeenMs = System.currentTimeMillis()
@@ -313,13 +406,28 @@ class MainActivity : AppCompatActivity() {
                     result.faceBoxRotated, result.rotatedImageWidth, result.rotatedImageHeight,
                     viewWidth, viewHeight, isFrontCamera = true
                 )
-                val roiView = CoordinateMapper.rotatedRectToViewRect(
-                    result.roiBoxRotated, result.rotatedImageWidth, result.rotatedImageHeight,
-                    viewWidth, viewHeight, isFrontCamera = true
-                )
-                overlayView.update(faceView, roiView)
+                // [Segment 35 Phase 2 item 4] one view-space rect per pooled
+                // region (forehead+both cheeks), not just the forehead box.
+                val roiViews = result.roiBoxesRotated.map { rect ->
+                    CoordinateMapper.rotatedRectToViewRect(
+                        rect, result.rotatedImageWidth, result.rotatedImageHeight,
+                        viewWidth, viewHeight, isFrontCamera = true
+                    )
+                }
+                overlayView.update(faceView, roiViews)
 
-                result.rgbSample?.let { signalBuffer.add(it) }
+                result.rgbSample?.let {
+                    signalBuffer.add(it)
+                    // [Segment 35 Phase 2 item 5] SignalBuffer just detected
+                    // (item 2) a real lost-face gap and cleared itself --
+                    // that is exactly "face reacquired after loss." A no-op
+                    // in OximetryCaptureController unless it is currently
+                    // LOCKED. Safe to call on every sample while true (it
+                    // stays true for a few post-gap samples): the controller
+                    // only re-locks from LOCKED, so a repeat call while
+                    // already re-metering does nothing.
+                    if (signalBuffer.isReacquiring) oximetry.onFaceReacquired()
+                }
 
                 // [Segment 34] exposure metering + calibration CSV row.
                 lastFrameSensorNs = result.sensorTimestampNs
@@ -346,10 +454,25 @@ class MainActivity : AppCompatActivity() {
         oximetrySwitch = findViewById(R.id.oximetrySwitch)
         lightingInput = findViewById(R.id.lightingInput)
         recordButton = findViewById(R.id.recordButton)
+        oximeterInsetImage = findViewById(R.id.oximeterInsetImage)
+        unmirrorPreviewSwitch = findViewById(R.id.unmirrorPreviewSwitch)
 
         findViewById<View>(R.id.vitalsCard).setOnLongClickListener {
-            calibrationPanel.visibility = if (calibrationPanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+            val nowVisible = calibrationPanel.visibility != View.VISIBLE
+            calibrationPanel.visibility = if (nowVisible) View.VISIBLE else View.GONE
+            // [Segment 35 Phase 3] the guide box + inset are calibration/
+            // debug aids -- shown together with the developer panel, not a
+            // separate always-visible UI element.
+            overlayView.showOximeterGuide = nowVisible
+            oximeterInsetImage.visibility = if (nowVisible) View.VISIBLE else View.GONE
             true
+        }
+        unmirrorPreviewSwitch.setOnCheckedChangeListener { _, checked ->
+            // [Segment 35 Phase 3 item 5] fallback if the inset framing is
+            // awkward in practice -- does not affect analysis frames (never
+            // mirrored to begin with) or anything OximeterInset reads, only
+            // PreviewView's own on-screen rendering.
+            previewView.scaleX = if (checked) -1f else 1f
         }
         oximetrySwitch.isChecked = useOximetryCapture
         oximetrySwitch.setOnCheckedChangeListener { _, checked ->
@@ -559,7 +682,22 @@ class MainActivity : AppCompatActivity() {
         // own every-Nth-frame skipped-detection cycles) doesn't flash it.
         val msSinceFace = System.currentTimeMillis() - lastFaceSeenMs
         val noFaceSustained = lastFaceSeenMs == 0L || msSinceFace > NO_FACE_DEBOUNCE_MS
-        noFaceBanner.visibility = if (noFaceSustained) View.VISIBLE else View.GONE
+        // [Segment 35 Phase 2 item 2] a face IS present but the buffer was
+        // just cleared after a real lost-face gap (docs/Segment35_Accuracy_
+        // Research_and_Plan.md finding H2) -- show "re-acquiring" instead of
+        // a spliced HR/SpO2 value. Checked independently of noFaceSustained:
+        // isReacquiring can be true even while a face is currently detected
+        // (the gap already ended), and noFaceSustained can be true without
+        // isReacquiring (a gap under the 0.5s clear threshold never sets it).
+        val reacquiring = signalBuffer.isReacquiring
+        noFaceBanner.visibility = if (noFaceSustained || reacquiring) View.VISIBLE else View.GONE
+        if (reacquiring && !noFaceSustained) {
+            noFaceBannerTitle.text = getString(R.string.reacquiring_banner_title)
+            noFaceBannerSubtitle.text = getString(R.string.reacquiring_banner_subtitle)
+        } else {
+            noFaceBannerTitle.text = getString(R.string.no_face_banner_title)
+            noFaceBannerSubtitle.text = getString(R.string.no_face_banner_subtitle)
+        }
 
         // HR: real pipeline (detrend -> bandpass -> CHROM/POS -> FFT), see
         // signal/RealHeartRateEstimator.kt. Null until enough of the buffer window
@@ -571,13 +709,18 @@ class MainActivity : AppCompatActivity() {
         // is byte-for-byte hrRaw unless explicitly enabled.
         val hrBpm = if (enableHrDisplaySmoothing) hrDisplaySmoother.smooth(hrRaw) else hrRaw
         lastHrBpm = hrBpm
-        hrText.text = if (hrBpm != null) {
+        // [Segment 35 Phase 2 item 2] show "re-acquiring" instead of a
+        // value that could still be a stale pre-gap estimator cache
+        // (RealHeartRateEstimator.update() returns its last cached bpm
+        // during warm-up, not null, and warm-up is exactly the state
+        // right after SignalBuffer clears on a real gap).
+        hrText.text = if (hrBpm != null && !reacquiring) {
             getString(R.string.hr_format, hrBpm)
         } else {
             getString(R.string.hr_placeholder_default)
         }
         applyStatusPill(
-            dot = hrStatusDot, label = hrStatusLabel, noFace = noFaceSustained,
+            dot = hrStatusDot, label = hrStatusLabel, noFace = noFaceSustained || reacquiring,
             status = heartRateEstimator.lastStatus, okText = getString(R.string.status_ok_hr)
         )
 
@@ -586,13 +729,13 @@ class MainActivity : AppCompatActivity() {
         // snapshot -- does not read heartRateEstimator's state or vice versa.
         val spo2 = spo2Estimator.update(samples)
         lastSpo2 = spo2
-        spo2Text.text = if (spo2 != null) {
+        spo2Text.text = if (spo2 != null && !reacquiring) {
             getString(R.string.spo2_format, spo2)
         } else {
             getString(R.string.spo2_placeholder_default)
         }
         applyStatusPill(
-            dot = spo2StatusDot, label = spo2StatusLabel, noFace = noFaceSustained,
+            dot = spo2StatusDot, label = spo2StatusLabel, noFace = noFaceSustained || reacquiring,
             status = spo2Estimator.lastStatus, okText = getString(R.string.status_ok_spo2)
         )
 
@@ -724,5 +867,12 @@ class MainActivity : AppCompatActivity() {
 
         /** How long a calibration row may wait for its frame's capture result. */
         private const val ROW_META_WAIT_MS = 300L
+
+        /** [Segment 35 Phase 3] Live oximeter-inset UI refresh throttle --
+         *  distinct from CalibrationRecorder's own 1 Hz JPEG-save throttle;
+         *  this one just needs to be fast enough to read a coarse LCD/LED
+         *  oximeter display comfortably, not fast enough to match the
+         *  camera's own frame rate. */
+        private const val OXIMETER_INSET_UI_UPDATE_INTERVAL_MS = 300L
     }
 }

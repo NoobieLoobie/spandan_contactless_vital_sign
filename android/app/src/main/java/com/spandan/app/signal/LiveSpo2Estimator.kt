@@ -95,17 +95,31 @@ class LiveSpo2Estimator {
             return cachedSpo2
         }
 
-        // Runtime-measured fs from real sample timestamps -- never hardcoded, same
-        // discipline as RealHeartRateEstimator/BandpassFilter/HeartRateFft.
-        val fs = (samples.size - 1) / windowSeconds
+        // [Segment 35 Phase 2 item 3] Same uniform-30Hz resample as
+        // RealHeartRateEstimator (independent call -- this class does not
+        // read from or call into that one, per this class's own KDoc), same
+        // fallback to the naive `(N-1)/windowSeconds` estimate when real
+        // per-sample sensor timestamps aren't available.
+        val resampled = ResampleUniform.resampleRgbSamples(samples)
+        val fs: Double
+        val rawR: DoubleArray
+        val rawB: DoubleArray
+        if (resampled != null) {
+            fs = resampled.fs
+            rawR = resampled.r
+            rawB = resampled.b
+        } else {
+            // Runtime-measured fs from real sample timestamps -- never hardcoded, same
+            // discipline as RealHeartRateEstimator/BandpassFilter/HeartRateFft.
+            fs = (samples.size - 1) / windowSeconds
+            rawR = DoubleArray(samples.size) { samples[it].red.toDouble() }
+            rawB = DoubleArray(samples.size) { samples[it].blue.toDouble() }
+        }
         if (fs <= 2.0 * BandpassFilter.HIGH_HZ) {
             Log.w(TAG, "Measured fs=$fs Hz too low for the 0.7-4Hz band; skipping this window")
             lastStatus = EstimatorStatus.LOW_SIGNAL_QUALITY
             return cachedSpo2
         }
-
-        val rawR = DoubleArray(samples.size) { samples[it].red.toDouble() }
-        val rawB = DoubleArray(samples.size) { samples[it].blue.toDouble() }
 
         // AC needs the bandpass-filtered trace (pulsatile amplitude); DC needs the
         // RAW trace (a bandpass filter's whole point is to remove the 0Hz/DC
@@ -154,8 +168,9 @@ class LiveSpo2Estimator {
 
         Log.d(
             TAG,
-            "R=%.4f rawSpo2=%.2f%% clampedSpo2=%.2f%% fs=%.2fHz n=%d PI_red=%.4f PI_blue=%.4f".format(
-                ratioOfRatios, rawSpo2, clampedSpo2, fs, samples.size, lastPerfusionIndexRed, lastPerfusionIndexBlue
+            "R=%.4f rawSpo2=%.2f%% clampedSpo2=%.2f%% fs=%.2fHz n=%d (raw=%d) resampled=%b PI_red=%.4f PI_blue=%.4f".format(
+                ratioOfRatios, rawSpo2, clampedSpo2, fs, rawR.size, samples.size, resampled != null,
+                lastPerfusionIndexRed, lastPerfusionIndexBlue
             )
         )
 
