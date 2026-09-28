@@ -365,16 +365,15 @@ step 1 of the protocol above.)*
   resumable) — not finished as of this entry; a future session (or this one, once the batch
   completes) must: (a) finish `matlab/docs/Segment35_MediaPipe_Anatomy_ROI.md` with the full
   132-subject result and a Holm-corrected promotion decision, (b) update this entry and the
-  Current State section above with the real verdict, (c) commit. Phase 2 (Android fix pack)
-  and Phase 3 (oximeter viewing box) are code-complete, 96/96 tests pass, but **NOT on-device
-  verified** — see `android/docs/Segment35_Android_Fix_Pack_And_Oximeter_Box.md` §4 for the
-  consolidated list of what Phase 4 must check. **Phase 4 (on-device test session) and Phase
-  5 (SpO2 calibration) are NOT STARTED — need Abrar physically holding the phone.** Phase 4's
-  test protocol (build, don't run) still needs writing as its own doc once Phase 1's MATLAB
-  result is in (a promoted anatomy ROI would need porting to Android before Phase 4, changing
-  the build matrix; a not-promoted result means Phase 4 tests the fix-pack build as already
-  built). Ask Abrar whether he wants the full 12-session matrix or a reduced one before Phase
-  4 starts, per the plan's own instruction.
+  Current State section above with the real verdict, (c) commit, (d) write the cross-phase
+  `docs/Segment35_Summary.md`. Phase 2 (Android fix pack) and Phase 3 (oximeter viewing box)
+  are code-complete, 96/96 tests pass, but **NOT on-device verified** — see `android/docs/
+  Segment35_Android_Fix_Pack_And_Oximeter_Box.md` §4 for the consolidated list of what Phase 4
+  must check. **Phase 4 (on-device test session) test protocol WRITTEN** (`docs/Segment35_
+  Phase4_OnDevice_Test_Protocol.md`, 12-session matrix + a 6-session reduced option) but
+  **ON HOLD — Abrar was asked full-vs-reduced and said "not now, hold off on Phase 4"
+  (2026-09-28).** Phase 5 (SpO2 calibration) stays blocked on Phase 4's data in the meantime.
+  A future session should re-offer Phase 4 rather than assume it's still declined indefinitely.
 
 - ~~**[2026-09-25, queued by Segment 33] Segment 34 — Android oximetry-grade capture + calibration recorder (NOT STARTED).**~~ **[2026-09-25] DONE — see the Segment 34 entry directly below.** Gated `useOximetryCapture` (AE/AWB/AF lock or manual exposure/ISO/gains, linear `CONTRAST_CURVE` tone map, clipped-pixel count, zero-light offset) + per-frame raw-RGB CSV logger for breath-hold calibration sessions; mandatory HR regression check; displayed SpO2 formula stays unchanged. Paste-ready prompt: `matlab/experiments/segment33_spo2_research/CLAUDE_CODE_PROMPT_Segment34.md`. Then: human breath-hold data collection (Segment 33 §7, pulse oximeter visible in frame) → fit β offline → anchored estimator behind a flag. Also ask the supervisor to request SUMS/LADH dataset access (faculty email required).
 
