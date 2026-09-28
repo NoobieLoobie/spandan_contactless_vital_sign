@@ -281,16 +281,18 @@ class MainActivity : AppCompatActivity() {
         val previewBuilder = Preview.Builder()
         val analysisBuilder = ImageAnalysis.Builder()
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            // [Segment 35 Phase 2 item 4] RGBA_8888 (single interleaved
-            // plane, no YUV->RGB conversion needed downstream -- see
-            // RoiPixelAverager.kt's own header) at 1280x720 (up from
-            // CameraX's own 640x480 default), so a widened forehead+cheeks
-            // ROI still pools a substantial pixel count per region even at
-            // stride 1. FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER: prefer a
-            // resolution >= 1280x720 if the device offers one, otherwise the
-            // closest lower one -- CameraX's own documented default
-            // fallback, kept explicit rather than silently defaulted.
-            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+            // [Segment 35 Phase 2 item 4, REVERTED on real-device test]
+            // RGBA_8888 was tried here (see git history) but crashes on a
+            // real device: ML Kit's InputImage.fromMediaImage(), which
+            // FaceAnalyzer.analyze() calls on every frame, ONLY accepts
+            // JPEG or YUV_420_888 (confirmed via a real FATAL EXCEPTION,
+            // Galaxy A35, "Only JPEG and YUV_420_888 are supported now") --
+            // an on-device-only failure mode no unit test here could catch
+            // (ImageProxy/InputImage aren't constructible in this project's
+            // plain-JUnit test setup). Staying on YUV_420_888;
+            // RoiPixelAverager.kt keeps its own YUV->RGB conversion. The
+            // 1280x720 target resolution and stride-1/multi-region pooling
+            // are unaffected by this revert and are kept.
             .setResolutionSelector(
                 ResolutionSelector.Builder()
                     .setResolutionStrategy(
@@ -357,6 +359,18 @@ class MainActivity : AppCompatActivity() {
     @ExperimentalGetImage
     private fun offerOximeterGuideCrop(imageProxy: ImageProxy) {
         if (calibrationPanel.visibility != View.VISIBLE) return
+
+        // [Segment 35 Phase 3, FIXED on real-device test] A real capture
+        // (Galaxy A35) found raw analysis throughput collapse from ~29fps to
+        // ~8.5fps while the developer panel was open -- because the crop
+        // extraction itself (a per-pixel YUV->RGB conversion + Bitmap
+        // allocation over the whole guide-box region) used to run on EVERY
+        // analysis frame, with only its two CONSUMERS (the UI update, the
+        // recorder save) throttled downstream. The throttle now gates the
+        // expensive work itself, not just what happens with its result.
+        val nowElapsed = SystemClock.elapsedRealtime()
+        if (nowElapsed - lastOximeterInsetUpdateElapsedMs < OXIMETER_INSET_UI_UPDATE_INTERVAL_MS) return
+
         val viewWidth = previewView.width
         val viewHeight = previewView.height
         if (viewWidth <= 0 || viewHeight <= 0) return
@@ -386,8 +400,6 @@ class MainActivity : AppCompatActivity() {
             recorder.saveOximeterCrop(crop, imageProxy.imageInfo.timestamp)
         }
 
-        val nowElapsed = SystemClock.elapsedRealtime()
-        if (nowElapsed - lastOximeterInsetUpdateElapsedMs < OXIMETER_INSET_UI_UPDATE_INTERVAL_MS) return
         lastOximeterInsetUpdateElapsedMs = nowElapsed
         uiHandler.post { oximeterInsetImage.setImageBitmap(crop) }
     }

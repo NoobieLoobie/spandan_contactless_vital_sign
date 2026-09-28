@@ -8,25 +8,28 @@ import com.spandan.app.signal.RgbSample
 
 /**
  * Spatially averages R/G/B pixel intensities inside an ROI rect, sampled
- * directly from the pixel planes of a CameraX ImageProxy -- no Bitmap/JPEG
- * round-trip needed.
+ * directly from the raw YUV_420_888 planes of a CameraX ImageProxy -- no
+ * Bitmap/JPEG round-trip needed.
  *
- * [Segment 35 Phase 2 item 4] Reads `OUTPUT_IMAGE_FORMAT_RGBA_8888` planes
- * (single interleaved plane, R/G/B/A byte order, per CameraX's own contract
- * for that output format) instead of the prior YUV_420_888 + BT.601
- * conversion. Two independent reasons, both from docs/Segment35_Accuracy_
- * Research_and_Plan.md's own Phase 2 item 4: (a) it removes a YUV->RGB
- * conversion step entirely -- one less place for rounding/clipping to add
- * noise upstream of CHROM/POS -- and (b) it is the same format Segment 30's
- * own "future re-attempt" note flagged as removing that segment's 71ms
- * YUV->Bitmap conversion tax, relevant again if/when a MediaPipe-based ROI
- * (Phase 1) is ever ported to Android. [SAMPLE_STRIDE] also drops from 2 to
- * 1 (denser sampling) per the same plan item, now that RGBA reads are a
- * single-plane lookup instead of three separate plane lookups per pixel.
+ * [Segment 35 Phase 2 item 4, REVERTED on real-device test] `OUTPUT_IMAGE_
+ * FORMAT_RGBA_8888` was tried here (see git history) to remove this file's
+ * own YUV->RGB conversion, but it crashes the app on a real device: ML
+ * Kit's `InputImage.fromMediaImage()`, which `FaceAnalyzer.analyze()` calls
+ * on every frame, ONLY accepts JPEG or YUV_420_888 (confirmed via a real
+ * `FATAL EXCEPTION`, Galaxy A35: "Only JPEG and YUV_420_888 are supported
+ * now") -- an on-device-only failure this project's plain-JUnit test setup
+ * cannot catch (`ImageProxy`/`InputImage` aren't constructible there).
+ * Reverted to YUV_420_888 + this file's own BT.601 conversion.
+ * [SAMPLE_STRIDE] stays 1 (kept from the RGBA attempt -- denser sampling is
+ * still worth it even at YUV's per-pixel 3-plane-lookup cost) and the
+ * production pipeline still pools forehead+both cheeks via
+ * [averageRgbMultiRect] (also kept) -- neither of those depended on the
+ * pixel format.
  *
- * This IS real, permanent code: spatial averaging is plain arithmetic and
- * reading a documented pixel format is not a tuned DSP parameter, so fixed
- * constants here are fine -- unlike CHROM/POS/bandpass coefficients
+ * This IS real, permanent code: spatial averaging is plain arithmetic, and
+ * the YUV->RGB conversion below is the standard, universal BT.601 colorspace
+ * formula (a physical-sensor-format conversion, not a tuned DSP parameter),
+ * so fixed constants here are fine -- unlike CHROM/POS/bandpass coefficients
  * elsewhere in this project, which must stay out of this codebase until the
  * MATLAB side finalizes them.
  */
@@ -35,12 +38,8 @@ object RoiPixelAverager {
     // [Segment 35 Phase 2 item 4] 1 (every pixel), down from 2 -- more
     // sampled pixels per ROI, closer to what Phase 1 validated offline
     // (pixel count, not placement, was the single factor Segment 7 Task
-    // H/J's notch-confidence investigation could confirm). Still a
-    // performance knob, not a signal-processing parameter.
+    // H/J's notch-confidence investigation could confirm).
     private const val SAMPLE_STRIDE = 1
-
-    /** Bytes per pixel in `OUTPUT_IMAGE_FORMAT_RGBA_8888`'s single plane. */
-    private const val RGBA_BYTES_PER_PIXEL = 4
 
     @ExperimentalGetImage
     fun averageRgb(imageProxy: ImageProxy, roiSensorRect: Rect): RgbSample? =
@@ -61,11 +60,12 @@ object RoiPixelAverager {
         val width = imageProxy.width
         val height = imageProxy.height
 
-        val plane = image.planes.getOrNull(0) ?: return null
-        val buffer = plane.buffer
-        val rowStride = plane.rowStride
-        val pixelStride = if (plane.pixelStride > 0) plane.pixelStride else RGBA_BYTES_PER_PIXEL
-        val capacity = buffer.capacity()
+        val yPlane = image.planes[0]
+        val uPlane = image.planes[1]
+        val vPlane = image.planes[2]
+        val yBuffer = yPlane.buffer
+        val uBuffer = uPlane.buffer
+        val vBuffer = vPlane.buffer
 
         var sumR = 0L
         var sumG = 0L
@@ -84,21 +84,28 @@ object RoiPixelAverager {
             while (y < bottom) {
                 var x = left
                 while (x < right) {
-                    val idx = y * rowStride + x * pixelStride
-                    if (idx + 2 < capacity) {
-                        val r = buffer.get(idx).toInt() and 0xFF
-                        val g = buffer.get(idx + 1).toInt() and 0xFF
-                        val b = buffer.get(idx + 2).toInt() and 0xFF
+                    val yIndex = y * yPlane.rowStride + x * yPlane.pixelStride
+                    val uvRow = y / 2
+                    val uvCol = x / 2
+                    val uIndex = uvRow * uPlane.rowStride + uvCol * uPlane.pixelStride
+                    val vIndex = uvRow * vPlane.rowStride + uvCol * vPlane.pixelStride
 
-                        sumR += r
-                        sumG += g
-                        sumB += b
+                    if (yIndex < yBuffer.capacity() && uIndex < uBuffer.capacity() && vIndex < vBuffer.capacity()) {
+                        val yVal = yBuffer.get(yIndex).toInt() and 0xFF
+                        val uVal = (uBuffer.get(uIndex).toInt() and 0xFF) - 128
+                        val vVal = (vBuffer.get(vIndex).toInt() and 0xFF) - 128
+
+                        // Standard BT.601 YUV -> RGB.
+                        val r = yVal + 1.402 * vVal
+                        val g = yVal - 0.344136 * uVal - 0.714136 * vVal
+                        val b = yVal + 1.772 * uVal
+
+                        sumR += r.coerceIn(0.0, 255.0).toLong()
+                        sumG += g.coerceIn(0.0, 255.0).toLong()
+                        sumB += b.coerceIn(0.0, 255.0).toLong()
                         // [Segment 34] clipped-pixel count for the oximetry
-                        // capture mode's exposure check / calibration CSV --
-                        // RGBA values are already discrete 0-255, no
-                        // clipping/coercion needed before this check (unlike
-                        // the prior YUV->RGB path's floating-point math).
-                        if (OximetryMath.isClipped(r.toDouble(), g.toDouble(), b.toDouble())) clipped++
+                        // capture mode's exposure check / calibration CSV.
+                        if (OximetryMath.isClipped(r, g, b)) clipped++
                         count++
                     }
                     x += SAMPLE_STRIDE

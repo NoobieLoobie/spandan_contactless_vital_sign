@@ -135,6 +135,10 @@ class OximetryCaptureController {
     private val lastVerboseLogMs = AtomicLong(0L)
     private var lockedAtMeta: FrameMeta? = null
     private var driftWarned = false
+    /** [Segment 35 Phase 2 item 5] When the most recent LOCKED state was
+     *  entered (elapsedRealtime) -- gates the drift check's settle window,
+     *  see [onRoiSample]'s own comment for why this exists. */
+    private var lockEnteredAtElapsedMs = 0L
 
     val captureCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
@@ -217,6 +221,18 @@ class OximetryCaptureController {
      *  ([Segment 35 Phase 2 item 5]); otherwise used only while METERING. */
     fun onRoiSample(sensorTimestampNs: Long, r: Double, g: Double, b: Double) {
         if (lockState == LockState.LOCKED) {
+            // [Segment 35 Phase 2 item 5, FIXED on real-device test] A real
+            // capture (Galaxy A35) found this drift check re-triggering a
+            // cascade of re-locks 1-2.6s apart, each one immediately
+            // "drifting" again relative to whatever the FRESH lock just
+            // settled at -- because the ROI reading right after a lock is
+            // itself a transient (AE/AWB still visually settling into the
+            // new exposure/gains for a moment), not yet a stable baseline to
+            // compare future samples against. Fix: don't drift-check for
+            // RELOCK_SETTLE_MS after entering LOCKED, giving that reading
+            // time to become a real baseline before anything is measured
+            // against it.
+            if (SystemClock.elapsedRealtime() - lockEnteredAtElapsedMs < RELOCK_SETTLE_MS) return
             val locked = lockedBrightestFraction
             if (locked != null && locked > 0.0) {
                 val current = OximetryMath.brightestChannelFraction(r, g, b)
@@ -482,6 +498,7 @@ class OximetryCaptureController {
         // finishLock only ever ran once per session, so this reset was
         // never reachable/necessary.
         driftWarned = false
+        lockEnteredAtElapsedMs = SystemClock.elapsedRealtime()
         setState(LockState.LOCKED, note)
     }
 
@@ -585,6 +602,14 @@ class OximetryCaptureController {
          *  rarely (a real lighting change not caught before HR/SpO2 visibly
          *  degrade) on a real capture. */
         const val RELOCK_DRIFT_FRACTION = 0.15
+
+        /** [Segment 35 Phase 2 item 5, added after a real-device test found
+         *  a re-lock cascade without it -- see [onRoiSample]'s own comment.
+         *  3s is a first, unmeasured guess at "long enough for the ROI
+         *  reading to stop being a post-lock transient" -- Phase 4 should
+         *  check whether this is too long (a real drift takes 3s longer to
+         *  react to) or still not long enough (another cascade). */
+        const val RELOCK_SETTLE_MS = 3000L
 
         fun aeStateName(s: Int?): String = when (s) {
             CaptureResult.CONTROL_AE_STATE_INACTIVE -> "INACTIVE"

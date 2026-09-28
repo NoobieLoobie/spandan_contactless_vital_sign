@@ -1,10 +1,12 @@
 # Segment 35 Phase 2/3 — Android fix pack + oximeter viewing box
 
-Date: 2026-09-28 · Status: **code complete, 0 physical device available this session — every
-item below needs Phase 4's real on-device check before any new default is trusted.**
-Executes `docs/Segment35_Accuracy_Research_and_Plan.md` Phases 2 and 3. All 96 unit tests
-pass (`./gradlew testDebugUnitTest`, 83 pre-existing + 13 new); `assembleDebug` succeeds
-(full debug APK builds clean). No MATLAB/iOS file touched.
+Date: 2026-09-28/29 · Status: **partially on-device verified (Galaxy A35, RFCXC0FFFSN,
+same-day follow-up session).** Written same-day as the code (2026-09-28) when no physical
+device was available; a device became available later the same day/into 2026-09-29 and a
+real on-device smoke test immediately caught and fixed **one real crash and two real bugs**
+(§4) — exactly the kind of thing this doc's original text warned could exist. All 96 unit
+tests pass (`./gradlew testDebugUnitTest`, 83 pre-existing + 13 new); `assembleDebug`
+succeeds. No MATLAB/iOS file touched.
 
 **Read first**: `docs/Segment35_Accuracy_Research_and_Plan.md` §2 (the H1-H6 diagnosis this
 phase fixes) and §4 (the oximeter box's original design). `android/docs/Segment29_
@@ -15,14 +17,20 @@ Capture.md` (the capture controller/recorder this phase extends).
 
 ## 0. Bottom line
 
+**§4 below is the important update**: an on-device smoke test found a real crash (RGBA_8888
+output breaks ML Kit's face detector) and two real bugs (a re-lock oscillation cascade, and
+a per-frame throughput collapse while the oximeter guide box is visible), all now fixed and
+re-verified live on the device. Everything below this table is otherwise as originally
+written (2026-09-28, before that test).
+
 | Item | What changed | On-device status |
 |---|---|---|
-| 1. minFaceSize | 0.35 → 0.18 | **CANDIDATE, NOT VALIDATED** — reasoned, not measured |
-| 2. Lost-face gap handling | SignalBuffer now clears + "re-acquiring" UI on a real >=0.5s gap (real timestamps), instead of silently splicing | Unit-tested (pure logic); needs real gap capture |
-| 3. Uniform resample | Branch 1 (HR + SpO2) now resamples to a uniform 30Hz grid via real per-sample sensor timestamps before filtering, same as Branch 2 already did | Unit-tested; needs real-device fs/jitter check |
-| 4. RGBA_8888 + widened ROI | 1280x720 RGBA output (was 640x480 YUV), stride 1 (was 2), forehead+both cheeks pooled (was forehead only) | **Not measured on-device** — fps/throughput cost unknown |
-| 5. Oximetry auto re-lock | Re-locks on >15% ROI brightness drift or face reacquired after loss; clears signal buffer on every re-lock | No new pure-math logic to unit-test (Camera2 types aren't mockable here, same as every existing untested class in `camera/`/`oximetry/`) |
-| Oximeter viewing box (Phase 3) | Guide box + labeled overlay, view→sensor crop mapping, live upright un-mirrored inset, once/sec JPEG saved into the existing calibration recorder, full-preview un-mirror fallback toggle | Not run — needs a face + phone to actually try holding an oximeter in frame |
+| 1. minFaceSize | 0.35 → 0.18 | Not dropping face in a ~10min stationary desk session (§4.4); still **NOT** a real handheld/motion measurement — Phase 4 |
+| 2. Lost-face gap handling | SignalBuffer now clears + "re-acquiring" UI on a real >=0.5s gap (real timestamps), instead of silently splicing | Unit-tested; **real gap-loss/reacquire scenario not exercised on-device** (my face never left frame during the smoke test) — Phase 4 |
+| 3. Uniform resample | Branch 1 (HR + SpO2) now resamples to a uniform 30Hz grid via real per-sample sensor timestamps before filtering, same as Branch 2 already did | **CONFIRMED ACTIVE on real device** — every log line shows `resampled=true`, real fs 30.00Hz from ~15-30 raw fps depending on mode (§4.4) |
+| 4. Widened ROI (RGBA_8888 REVERTED) | 1280x720, stride 1 (was 2), forehead+both cheeks pooled (was forehead only) — the RGBA_8888 output format itself was reverted to YUV_420_888 after a real crash (§4.1) | **Multi-region ROI confirmed rendering correctly live** (§4.4 screenshot: 3 yellow boxes, forehead + both cheeks); resolution/stride change not separately fps-profiled |
+| 5. Oximetry auto re-lock | Re-locks on >15% ROI brightness drift or face reacquired after loss; clears signal buffer on every re-lock | **Real bug found + fixed on-device** (§4.2): an immediate re-lock cascade (1-2.6s apart) — added a 3s post-lock settle window. Confirmed real Camera2 PREROLL→METERING→LOCKED sequence completes and holds; **RELOCK_SETTLE_MS=3000/RELOCK_DRIFT_FRACTION=0.15 still not properly tuned** (§4.2's honest caveat) |
+| Oximeter viewing box (Phase 3) | Guide box + labeled overlay, view→sensor crop mapping, live upright un-mirrored inset, once/sec JPEG saved into the existing calibration recorder, full-preview un-mirror fallback toggle | **Real throughput bug found + fixed** (§4.3): the crop was computed on every frame, not just its outputs throttled — fps collapsed 29.5→8.5/s while the panel was open; fixed by throttling the extraction itself. Guide box/inset render (partially covered by the dev panel's own layout, §4.5); **not tried with an actual oximeter** |
 
 **Nothing here is promoted as a validated default.** Every numeric choice (0.18 minFaceSize,
 0.5s gap threshold, 15% drift threshold, 30Hz resample target, the guide box's screen
@@ -95,14 +103,24 @@ stays constant (no drift from the interpolation itself).
 **Needs Phase 4**: real on-device fs/jitter measurement to confirm this actually changes the
 HR/SpO2 numbers in the direction expected (H3 predicted a bias, not measured this session).
 
-### Item 4 — RGBA_8888 @ 1280x720, stride 1, forehead+cheeks (`RoiPixelAverager.kt`, `FaceAnalyzer.kt`, `MainActivity.kt`)
+### Item 4 — 1280x720, stride 1, forehead+cheeks (`RoiPixelAverager.kt`, `FaceAnalyzer.kt`, `MainActivity.kt`)
+
+> **CORRECTION (§4.1, real on-device test, same day)**: this item originally also switched
+> `ImageAnalysis` to `OUTPUT_IMAGE_FORMAT_RGBA_8888`. That crashed ML Kit's face detector on
+> a real device (`InputImage.fromMediaImage()` only accepts JPEG/YUV_420_888) and was
+> reverted back to YUV_420_888 before this doc's own on-device section was written. The text
+> immediately below is left as originally written (describing the RGBA attempt) for an
+> honest record of what was tried; §4.1 has the full story and the actual shipped state.
 
 - `ImageAnalysis` now requests `OUTPUT_IMAGE_FORMAT_RGBA_8888` at a `ResolutionSelector`
   target of 1280x720 (`FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER`), replacing the previous
-  YUV_420_888 @ 640x480 default.
+  YUV_420_888 @ 640x480 default. **[REVERTED, see correction above — stayed on YUV_420_888,
+  1280x720 target kept.]**
 - `RoiPixelAverager` rewritten for RGBA's single interleaved plane (no more BT.601 YUV→RGB
   math) — `averageRgb` now just delegates to `averageRgbMultiRect` with a one-element list,
-  removing the duplicate averaging loop the two functions previously had.
+  removing the duplicate averaging loop the two functions previously had. **[REVERTED —
+  `averageRgbMultiRect` still delegates the same way, but reads Y/U/V planes with BT.601
+  conversion again, per the correction above.]**
 - `SAMPLE_STRIDE` 2 → 1 (every pixel), since a single-plane RGBA read is cheaper per pixel
   than three separate YUV plane lookups were.
 - `FaceAnalyzer.emitFaceDetected` now pools **forehead + both cheeks**
@@ -207,28 +225,157 @@ the crop is legible enough to read digits from (the design assumes it is, per th
 detection), `signal/ResampleUniform.kt` (`resampleRgbSamples`), `signal/
 RealHeartRateEstimator.kt`, `signal/LiveSpo2Estimator.kt` (both call the new resample),
 `signal/ResampleUniformTest.kt` (+4 tests), `camera/FaceAnalyzer.kt` (`minFaceSize`,
-multi-region ROI, `roiBoxesRotated`), `camera/RoiPixelAverager.kt` (RGBA rewrite),
+multi-region ROI, `roiBoxesRotated`), `camera/RoiPixelAverager.kt` (multi-region pooling +
+stride 1, still YUV_420_888 — see §4.1 for the RGBA_8888 attempt-and-revert),
 `camera/CoordinateMapper.kt` (`viewRectToRotatedRect`), `camera/CoordinateMapperTest.kt`
 (+2 tests), `ui/OverlayView.kt` (multi-rect ROI drawing, guide box), `oximetry/
-OximetryCaptureController.kt` (re-lock), `oximetry/CalibrationRecorder.kt`
-(`saveOximeterCrop`), `MainActivity.kt` (RGBA/1280x720 analysis builder, gap→reacquire UI,
-oximeter crop wiring, un-mirror switch), `res/layout/activity_main.xml`,
+OximetryCaptureController.kt` (re-lock + §4.2's settle-window fix), `oximetry/
+CalibrationRecorder.kt` (`saveOximeterCrop`), `oximetry/OximeterInset.kt` (YUV_420_888, see
+§4.1), `MainActivity.kt` (1280x720 analysis builder, gap→reacquire UI, oximeter crop wiring
++ §4.3's extraction-level throttle fix, un-mirror switch), `res/layout/activity_main.xml`,
 `res/values/strings.xml`.
 
 **Test count**: 96/96 pass (83 pre-existing + 13 new: 7 `SignalBufferTest`, 4
-`ResampleUniformTest`, 2 `CoordinateMapperTest`). `assembleDebug` succeeds.
+`ResampleUniformTest`, 2 `CoordinateMapperTest`). `assembleDebug` succeeds. All confirmed
+again after the §4 on-device fixes, not just before them.
 
-## 4. What Phase 4 must actually check (consolidated)
+## 4. On-device smoke test (2026-09-28/29, Galaxy A35, RFCXC0FFFSN) — real bugs found and fixed
 
-1. `minFaceSize` 0.18 vs 0.35 — missed-face % and fps, handheld, arm's length.
-2. The 0.5s gap-clear threshold — too eager (normal skip cycles) vs too lax (a real loss
-   still splicing through).
-3. Whether the uniform-30Hz resample changes displayed HR/SpO2, and in which direction.
-4. RGBA_8888@1280x720/stride-1/3-region throughput cost, and whether HR/SpO2 accuracy moves
-   (better or worse) versus the pre-Segment-35 forehead-only 640x480 YUV build.
-5. The 15% brightness re-lock threshold's false-positive/false-negative rate.
-6. Whether the oximeter guide box's position/size is actually usable one-handed, and whether
-   the inset crop is legible enough to read digits from.
+A device became available the same day this doc's code was written. Rather than wait for a
+full Phase 4 session, a quick install-and-watch-logcat smoke test was run immediately — and
+immediately justified itself: the very first launch crashed. What follows is every real
+finding, in the order they were hit, each with the fix applied and re-verified live.
 
-This is exactly Segment 35 Phase 4's own test matrix — see `docs/Segment35_Summary.md` (once
-written) for the consolidated protocol and the question of full vs. reduced matrix.
+### 4.1 Real crash: RGBA_8888 breaks ML Kit's face detector
+
+First launch (`adb install` + `am start`) crashed on the very first analysis frame:
+
+```
+FATAL EXCEPTION: pool-4-thread-1
+java.lang.IllegalArgumentException: Only JPEG and YUV_420_888 are supported now
+	at com.google.mlkit.vision.common.InputImage.fromMediaImage(...)
+	at com.spandan.app.camera.FaceAnalyzer.analyze(FaceAnalyzer.kt:216)
+```
+
+Phase 2 item 4's `OUTPUT_IMAGE_FORMAT_RGBA_8888` (chosen to remove `RoiPixelAverager`'s own
+YUV→RGB conversion) is incompatible with `InputImage.fromMediaImage()`, which `FaceAnalyzer.
+analyze()` calls on every frame for ML Kit face detection — an on-device-only failure this
+project's plain-JUnit test setup cannot catch (`ImageProxy`/`InputImage` aren't constructible
+there; confirmed no such test exists anywhere in this project even for the pre-existing
+camera pipeline). **Fixed**: reverted the analysis stream to YUV_420_888;
+`RoiPixelAverager.kt` and `OximeterInset.kt` both rewritten back to read Y/U/V planes with
+the standard BT.601 conversion (stride 1 and forehead+cheeks multi-region pooling, both
+independent of pixel format, are kept). The 1280x720 target resolution is unaffected and
+kept. Re-verified: app launches, runs, zero crashes for the remainder of the session
+(confirmed via `adb logcat -d | grep -c "FATAL EXCEPTION"` → 0, and a stable `pidof` across
+every subsequent test).
+
+### 4.2 Real bug: re-lock oscillation cascade
+
+With the crash fixed, toggling "Locked linear" in the developer panel completed a real
+Camera2 PREROLL→METERING→LOCKED sequence cleanly (~5s, ROI settling at 47% of full scale,
+within the 40-60% target). But watching `SPANDAN_OXI` logs over the next ~10s:
+
+```
+05:50:30.188  RELOCK triggered: ROI brightness drifted 47% -> 40%   (1.1s after lock)
+05:50:31.318  STATE LOCKED (58%)
+05:50:31.591  RELOCK triggered: ROI brightness drifted 58% -> 49%   (0.27s after lock)
+05:50:32.804  STATE LOCKED (46%)
+05:50:33.102  RELOCK triggered: ROI brightness drifted 46% -> 54%   (0.30s after lock)
+05:50:34.278  STATE LOCKED (53%)
+05:50:35.683  RELOCK triggered: ROI brightness drifted 53% -> 62%   (1.4s after lock)
+```
+
+A genuine cascade — re-locking every 0.3-1.4s, which would make `useOximetryCapture`
+completely unusable in practice (the signal buffer clears on every re-lock, per design, so it
+would never accumulate the ~4s minimum `RealHeartRateEstimator`/`LiveSpo2Estimator` need).
+Root cause: the ROI reading immediately after a fresh lock is itself a transient (AE/AWB
+still visually settling into the new exposure/gains), not yet a stable baseline — comparing
+the very next sample against it as if it were stable is what triggers the immediate
+re-drift. **Fixed**: added a 3-second post-lock settle window (`RELOCK_SETTLE_MS`,
+`OximetryCaptureController.lockEnteredAtElapsedMs`) — no drift check runs until that window
+passes. Re-verified on the same device: re-locking still happened 3 times over the next ~19s
+(at 3.0s, 3.0s, and 6.8s after each prior lock — plausibly real instability while the AE
+system found a stable point, not an artifact of the fix), then held LOCKED with zero further
+re-locks for the rest of the observation window (19s+). **Honest caveat, not smoothed
+over**: the cooldown fixes the sub-second cascade, but the fact that re-locks still landed
+right at the 3.0s boundary twice in a row is suspicious — either the scene was genuinely
+unstable during this specific ad-hoc test (plausible: talking, adjusting the phone, and
+testing other features throughout), or 3s still isn't quite long enough for the ROI reading
+to fully settle. `RELOCK_SETTLE_MS=3000`/`RELOCK_DRIFT_FRACTION=0.15` are NOT validated
+defaults — Phase 4 needs a controlled (phone on a stand, steady lighting, person holding
+still) measurement of the real re-lock rate before either constant is trusted.
+
+### 4.3 Real bug: per-frame oximeter-crop cost collapses throughput
+
+With the developer panel open (needed to see the guide box / trigger the lock), raw HR
+sample throughput measured via `RealHeartRateEstimator`'s own log (`raw=N` over a 25s
+window) was **~8.5 samples/sec** — versus ~29.5/s measured moments later with the panel
+closed. Root cause: `MainActivity.offerOximeterGuideCrop` computed the full per-pixel
+YUV→RGB crop+conversion on **every single analysis frame** whenever the panel was visible;
+only its two consumers (the live inset's UI update, the once/sec JPEG save) were throttled
+downstream — the expensive work itself ran unthrottled. **Fixed**: the throttle now gates
+the extraction itself (checked first, before any geometry/crop work), not just what happens
+with its result. Re-verified: with the panel open and locked capture active, raw throughput
+recovered to **~22-24 samples/sec** — most of the way back to the panel-closed rate. This
+also means: **every prior "not on-device verified" throughput claim about Phase 3 in this
+doc's original text was, if anything, understating the problem** — the box wasn't just
+untested, it had a real, severe cost that is now fixed.
+
+### 4.4 Confirmed working correctly, live on the device
+
+- **Multi-region ROI (Phase 2 item 4)**: a real screenshot shows all three yellow boxes
+  (forehead + both cheeks) correctly placed on a real face, inside the green face box.
+- **Uniform 30Hz resample (Phase 2 item 3)**: every `RealHeartRateEstimator`/
+  `LiveSpo2Estimator` log line shows `resampled=true`; raw sample counts (213-750 depending
+  on mode/panel state) confirm real, non-uniform camera timestamps are being fed through
+  `ResampleUniform.resampleRgbSamples` for real, not falling back to the naive path.
+- **`minFaceSize=0.18`**: no missed-face event observed across the whole session (multiple
+  minutes, stationary desk framing, one face continuously in frame) — a weak positive signal
+  only; this is not the handheld/arm's-length motion test Phase 4 still needs.
+- **Developer panel + guide box + un-mirror switch**: panel opens/closes via long-press, the
+  new "Un-mirror preview" switch is present and wired (not separately confirmed to flip the
+  preview visually this session), the guide box's dashed outline and "Keep oximeter screen
+  here" label render (partially obscured by the panel itself, see §4.5).
+- **Oximetry lock (Segment 34 logic, unaffected by this session's changes)**: real
+  PREROLL→METERING→LOCKED sequence, linear tone curve applied, AE/AWB genuinely lock.
+
+### 4.5 New minor finding, not fixed this session: dev panel overlaps the guide box/inset
+
+The calibration panel (`calibrationPanel`, opened for exactly the controls a real Phase 4
+session needs) visually overlaps the same top region `OximeterGuideBox`'s guide rectangle
+and `oximeterInsetImage`'s inset occupy — so while positioning an oximeter (which needs the
+panel open, to see status / hit Start rec), the guide box is only partially visible and the
+live inset is fully hidden behind the panel. Not fixed here (a design decision — move the
+inset, shrink/reflow the panel, or accept glancing at the guide before opening the panel —
+needs Abrar's input on what's actually usable in practice, not a guess). Flagged for Phase 4.
+
+### 4.6 What is still NOT on-device verified after this smoke test
+
+- A real lost-face gap / reacquire scenario (item 2) — the face never left frame.
+- A real handheld/motion `minFaceSize` test — this was a stationary desk framing throughout.
+- The oximeter guide box/inset with an actual oximeter in view — not tried.
+- `RELOCK_SETTLE_MS`/`RELOCK_DRIFT_FRACTION` under controlled (not ad-hoc) conditions.
+- Any accuracy comparison (HR/SpO2 vs a real oximeter) — this was a functional/crash/
+  throughput smoke test only, not a Phase 4 accuracy session.
+
+---
+
+## 5. What Phase 4 must actually check (consolidated, updated after §4)
+
+1. `minFaceSize` 0.18 vs 0.35 — missed-face % and fps, handheld, arm's length (§4.4's
+   stationary desk test is not this).
+2. The 0.5s gap-clear threshold, and the full lost-face → re-acquire UI path — not exercised
+   at all yet (§4.6).
+3. Whether the uniform-30Hz resample changes displayed HR/SpO2 accuracy, and in which
+   direction (§4.4 confirms it's active; not confirmed to help or hurt accuracy).
+4. Widened-ROI (forehead+cheeks, stride 1, 1280x720) throughput cost and accuracy, versus the
+   pre-Segment-35 forehead-only 640x480 build. Format is YUV_420_888 again (§4.1), not RGBA.
+5. `RELOCK_SETTLE_MS`/`RELOCK_DRIFT_FRACTION`'s real false-positive/negative rate under
+   controlled conditions (§4.2's honest caveat — the ad-hoc test wasn't controlled).
+6. Whether the oximeter guide box's position/size is actually usable one-handed with a real
+   oximeter, whether the inset crop is legible enough to read digits from, and what to do
+   about §4.5's panel/guide-box overlap.
+
+This is exactly Segment 35 Phase 4's own test matrix — see `docs/Segment35_Phase4_
+OnDevice_Test_Protocol.md` for the consolidated protocol (currently on hold per Abrar).
