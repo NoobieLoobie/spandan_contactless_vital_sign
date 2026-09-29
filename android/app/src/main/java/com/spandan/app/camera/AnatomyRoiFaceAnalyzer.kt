@@ -92,6 +92,28 @@ class AnatomyRoiFaceAnalyzer(
     private var pendingRotatedImageWidth = 0
     private var pendingRotatedImageHeight = 0
 
+    // [Real bug, found on-device 2026-09-29] MediaPipe Tasks Vision's
+    // LIVE_STREAM mode requires STRICTLY INCREASING timestamps across
+    // detectAsync calls -- undocumented consequence, confirmed empirically
+    // this session: a real Camera2 session hiccup (logcat showed
+    // CameraManagerGlobal briefly reporting STATUS_NOT_AVAILABLE, then
+    // CameraX transparently reopening the SAME camera and reusing this
+    // SAME analyzer instance -- ordinary CameraX recovery, not a rebind
+    // through MainActivity.bindUseCases()) made imageProxy.imageInfo.timestamp
+    // reset to a lower value on the reopened session. FaceLandmarker
+    // silently stopped invoking onLandmarkResult/onLandmarkError for the
+    // REST OF THE APP SESSION after that one non-monotonic call -- no
+    // crash, no error callback, just permanent silence, which froze the
+    // HR/SpO2 display at their last real values while `lastStatus` stayed
+    // whatever it was before (observed: stuck at "Warming up" with a
+    // ~30s-stale bpm/SpO2% on screen). The classical FaceAnalyzer.kt path
+    // never had this failure mode because ML Kit's InputImage.fromMediaImage
+    // is a stateless per-call Task with no cross-call timestamp contract --
+    // this is specific to MediaPipe's LIVE_STREAM API. Fixed by clamping
+    // every timestamp sent to detectAsync to be strictly greater than the
+    // last one actually sent, regardless of what the camera reports.
+    private var lastSentTimestampMs = 0L
+
     @ExperimentalGetImage
     override fun analyze(imageProxy: ImageProxy) {
         val mediaImage = imageProxy.image
@@ -137,7 +159,14 @@ class AnatomyRoiFaceAnalyzer(
         pendingRotatedImageHeight = rotatedImageHeight
 
         val mpImage = BitmapImageBuilder(rotatedBitmap).build()
-        faceLandmarker.detectAsync(mpImage, imageProxy.imageInfo.timestamp / 1_000_000)
+        // Clamp to strictly increasing -- see lastSentTimestampMs's own KDoc
+        // for the real on-device failure this prevents (a camera-session
+        // hiccup resetting imageProxy.imageInfo.timestamp permanently
+        // silences FaceLandmarker's LIVE_STREAM callbacks otherwise).
+        val rawTimestampMs = imageProxy.imageInfo.timestamp / 1_000_000
+        val sendTimestampMs = maxOf(rawTimestampMs, lastSentTimestampMs + 1)
+        lastSentTimestampMs = sendTimestampMs
+        faceLandmarker.detectAsync(mpImage, sendTimestampMs)
     }
 
     /** Shared LIVE_STREAM resultListener -- see [analyze]'s own note on why
@@ -205,7 +234,7 @@ class AnatomyRoiFaceAnalyzer(
             listOf(boxes.forehead, boxes.leftCheek, boxes.rightCheek),
             sensorTimestampNs = imageProxy.imageInfo.timestamp
         )
-        onResult(toFaceDetected(boxes, rotatedImageWidth, rotatedImageHeight, rgbSample))
+        onResult(toFaceDetected(boxes, rotatedImageWidth, rotatedImageHeight, rgbSample, imageProxy.imageInfo.timestamp))
     }
 
     /** Skipped-detection path: no fresh bitmap was converted this frame, so
@@ -237,14 +266,15 @@ class AnatomyRoiFaceAnalyzer(
             sensorTimestampNs = sensorTimestampNs
         )
         rotatedBitmap.recycle()
-        onResult(toFaceDetected(boxes, rotatedImageWidth, rotatedImageHeight, rgbSample))
+        onResult(toFaceDetected(boxes, rotatedImageWidth, rotatedImageHeight, rgbSample, sensorTimestampNs))
     }
 
     private fun toFaceDetected(
         boxes: AnatomyRoiCalculator.AnatomyBoxes,
         rotatedImageWidth: Int,
         rotatedImageHeight: Int,
-        rgbSample: com.spandan.app.signal.RgbSample?
+        rgbSample: com.spandan.app.signal.RgbSample?,
+        sensorTimestampNs: Long
     ): FaceAnalysisResult.FaceDetected {
         val unionBox = Rect(boxes.forehead)
         unionBox.union(boxes.leftCheek)
@@ -254,7 +284,31 @@ class AnatomyRoiFaceAnalyzer(
             roiBoxRotated = boxes.forehead,
             rotatedImageWidth = rotatedImageWidth,
             rotatedImageHeight = rotatedImageHeight,
-            rgbSample = rgbSample
+            rgbSample = rgbSample,
+            // [Real bug, found on-device 2026-09-29] Same category as the
+            // roiBoxesRotated gap below -- this field defaults to 0L, and I
+            // originally never threaded the real sensor timestamp through.
+            // Used by MainActivity for oximetry capture's per-frame
+            // metadata join and the calibration CSV, not by SignalBuffer
+            // (which reads RgbSample's OWN sensorTimestampNs field,
+            // correctly set in AnatomyRoiPixelAverager.averageRgb's call
+            // above -- so this specific gap was NOT the HR-freeze cause,
+            // but a real, separate bug in its own right).
+            sensorTimestampNs = sensorTimestampNs,
+            // [Real bug, found on-device 2026-09-29] Without this, the
+            // default (a single-element list of roiBoxRotated -- see
+            // FaceAnalysisResult's own KDoc) meant the overlay drew only
+            // the forehead box, not all 3 anatomy regions, even though
+            // the rgbSample above (computed a few lines up via
+            // averageRgb(..., listOf(boxes.forehead, boxes.leftCheek,
+            // boxes.rightCheek))) was already correctly pooling all 3 --
+            // this was a pure visualization gap, not a pixel-averaging
+            // bug. Missed originally because AnatomyRoiFaceAnalyzer.kt was
+            // written against FaceAnalyzer.kt's OLDER definition (from the
+            // android_segment30_mediapipe/ copy read during research),
+            // which predates FaceAnalysisResult gaining this field in the
+            // real production camera/FaceAnalyzer.kt.
+            roiBoxesRotated = listOf(boxes.forehead, boxes.leftCheek, boxes.rightCheek)
         )
     }
 

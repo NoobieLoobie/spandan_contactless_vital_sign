@@ -1,8 +1,9 @@
 # Segment 36 — MediaPipe FaceLandmarker anatomy-ROI port + on/off toggle
 
-Date: 2026-09-29 · Status: **code complete, 111/111 unit tests pass, `assembleDebug`
-succeeds. NOT on-device verified this session** (no physical Android device attached to
-this environment, no `adb` found either — confirmed by search, not assumed).
+Date: 2026-09-29–30 · Status: **code complete, unit tests pass, `assembleDebug`
+succeeds, ON-DEVICE VERIFIED** (Galaxy A35, side-by-side install as
+`com.spandan.app.anatomy`). Two real bugs found and fixed via on-device testing (§6);
+one reliability characteristic identified and mitigated but not fully root-caused (§6.3).
 
 ---
 
@@ -108,25 +109,91 @@ two more instances of:
    than silently passing — worth recording so a future session recognizes the same
    symptom immediately instead of re-deriving it.
 
-## 5. Honest status and what a real device session must check
+## 5. Honest status before on-device testing (superseded by §6)
 
-**Not done this session** (no device, no `adb`):
-- Whether `AnatomyRoiFaceAnalyzer` actually runs without crashing on first launch
-  (MediaPipe LIVE_STREAM setup, model asset loading, the Bitmap-rotate step).
-- Real fps cost of FaceLandmarker + the Bitmap conversion + the rotate step combined —
-  inherited estimate only (Segment 30's ~87ms bundled FaceDetector cost is a related but
-  not identical measurement; FaceLandmarker does more work per call, not less).
-- Whether the pre-rotate-then-detect coordinate convention actually lands landmarks in
-  the right place on a real face (the unit tests verify the BOX MATH given a landmark
-  map, not that MediaPipe's own returned landmarks + the rotation step compose
-  correctly).
-- Whether toggling `anatomyRoiSwitch` mid-session cleanly rebinds the camera (no
-  double-bind crash, no leaked native resources beyond what `activeAnatomyAnalyzer?.close()`
-  already targets).
-- Real HR/SpO2/Branch-2 accuracy comparison between the two ROI modes on live video —
-  the entire reason this toggle exists, and it needs a real capture session to answer.
+Section 4/5 above described the pre-device state. The open items listed there
+(crash-on-launch risk, real fps cost, landmark coordinate correctness, toggle rebind
+safety) were resolved by the on-device session below — **except** the full structured
+A/B HR/SpO2 accuracy capture, which still needs a dedicated session (see §6.4).
 
-**Do next, in order**: connect a device, launch the app, flip the toggle with a face in
-frame, confirm no crash and a plausible HR reading, then a structured A/B capture
-(same person, same lighting, toggle on vs. off) mirroring Segment 35 Phase 4's own
-protocol.
+## 6. On-device verification (2026-09-29, Galaxy A35, side-by-side `com.spandan.app.anatomy`)
+
+App installed and launched cleanly alongside the existing `com.spandan.app` build with no
+collision (separate `applicationId`, separate icon/name — "Spandan Anatomy", orange pulse
+icon). `assembleDebug` + `testDebugUnitTest` both passed before every reinstall.
+
+### 6.1 Two real bugs found and fixed
+
+1. **Overlay showed only 1 of 3 anatomy boxes.** `AnatomyRoiFaceAnalyzer.toFaceDetected()`
+   was written against an **older, cached copy** of `FaceAnalyzer.kt`'s
+   `FaceAnalysisResult.FaceDetected` (from the `android_segment30_mediapipe/` research
+   copy), which predates the real production data class gaining a
+   `roiBoxesRotated: List<Rect>` field. Without it, `MainActivity`'s overlay code fell
+   back to its single-box default (`listOf(roiBoxRotated)` = forehead only), even though
+   `AnatomyRoiPixelAverager.averageRgb` was already correctly pooling pixels from all 3
+   regions (forehead + both cheeks) — a pure visualization gap, not a signal bug. Fixed by
+   setting `roiBoxesRotated = listOf(boxes.forehead, boxes.leftCheek, boxes.rightCheek)`
+   explicitly. Verified via device screenshot showing all 3 boxes drawn.
+2. **`FaceDetected.sensorTimestampNs` (the top-level field, distinct from
+   `RgbSample.sensorTimestampNs`) always defaulted to `0L`** — never threaded through from
+   `AnatomyRoiFaceAnalyzer`. This field feeds `MainActivity`'s oximetry per-frame
+   metadata/calibration CSV, not `SignalBuffer` (which reads `RgbSample`'s own,
+   correctly-set timestamp) — so this was NOT the cause of the freeze in §6.2, but a real,
+   separate bug affecting oximetry capture bookkeeping. Fixed by threading a
+   `sensorTimestampNs: Long` parameter through both `emitBoxesResultFromBitmap` and
+   `emitBoxesResult` call sites into `toFaceDetected`.
+
+### 6.2 A real, more serious bug: MediaPipe LIVE_STREAM silent freeze on camera hiccup
+
+After roughly 26 seconds of healthy operation, `RealHeartRateEstimator` / `LiveSpo2Estimator`
+/ `MorphologyWaveformEstimator` stopped logging entirely for 40+ seconds, while
+camera/`SPANDAN_OXI` logs continued normally. A full logcat dump pinpointed a genuine
+Camera2 session hiccup at that exact moment — `CameraManagerGlobal` briefly reported
+`STATUS_NOT_AVAILABLE`, then CameraX transparently reopened the same camera and reused the
+same `AnatomyRoiFaceAnalyzer` instance (ordinary CameraX self-recovery, not triggered by any
+app code / rebind). This reset `imageProxy.imageInfo.timestamp` to a lower value on the
+reopened session, violating MediaPipe Tasks Vision's **undocumented** LIVE_STREAM
+requirement that timestamps passed to `detectAsync` be strictly increasing across the whole
+`FaceLandmarker` instance's lifetime. FaceLandmarker responded by silently ceasing to invoke
+`onLandmarkResult`/`onLandmarkError` for the rest of the app session — no crash, no error
+callback — freezing the HR/SpO2 display at stale values. The classical `FaceAnalyzer.kt`
+path never hits this because ML Kit's `InputImage.fromMediaImage` is a stateless per-call
+`Task` with no cross-call timestamp contract; this is specific to MediaPipe's LIVE_STREAM
+API.
+
+**Fix applied**: `AnatomyRoiFaceAnalyzer` now tracks `lastSentTimestampMs` and clamps every
+timestamp sent to `detectAsync` via `maxOf(rawTimestampMs, lastSentTimestampMs + 1)`,
+regardless of what the camera reports. This fix's effectiveness against the *exact* original
+trigger (a real Camera2 `STATUS_NOT_AVAILABLE` hiccup) was **not independently
+re-confirmed** — that hiccup could not be forced on demand — but subsequent monitoring
+windows did not reproduce the permanent-freeze symptom, only the milder cycling described
+next.
+
+### 6.3 Remaining, unresolved characteristic: more frequent "Warming up" cycling than classical mode
+
+Even after both fixes above, sustained monitoring windows showed the UI cycling through
+"No face detected" / "Re-acquiring signal" more often than the classical `FaceAnalyzer`
+path does, which kept `RealHeartRateEstimator` from holding a sustained "Live" (OK) status
+for long. This is **not** the same bug as §6.2 — targeted diagnostic logging (since removed;
+see below) confirmed the analyzer itself stayed healthy throughout these cycles: `faces=1`
+detected continuously, `rgbSample` non-null with ~19,000 sampled pixels, unbroken
+`detectAsync`→`onLandmarkResult` pairs. The pipeline always recovered on its own — this is a
+reliability/sensitivity gap, not a crash or a permanent freeze. Leading hypothesis (not
+confirmed): MediaPipe FaceLandmarker's face-presence signal may be more sensitive to head
+angle/pose than ML Kit's detector, and/or the shared buffer's gap-detection logic is
+trigger-happy for either ROI mode but only visible here because FaceLandmarker itself drops
+"face present" more readily. **Not fixed this session** — documented as a known limitation
+of the anatomy-ROI toggle relative to the classical default.
+
+The diagnostic `Log.d(TAG, "DIAG ...")` lines added to `analyze()`, the `detectAsync` call
+site, `onLandmarkResult()`, `emitBoxesResultFromBitmap()`, and `emitBoxesResult()` during
+this investigation have been **removed** now that the two real bugs above are fixed and
+this characteristic is documented — normal operation no longer logs per-frame diagnostics
+from this analyzer (only the pre-existing `onLandmarkError` warning path remains).
+
+### 6.4 Still needed
+
+A structured A/B HR/SpO2/Branch-2 accuracy capture (same person, same lighting, toggle
+on vs. off), mirroring Segment 35 Phase 4's protocol — this toggle's actual reason for
+existing — has not been run yet. The on-device work this session was bug-fixing/
+reliability diagnosis, not an accuracy comparison.
