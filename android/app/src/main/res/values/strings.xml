@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Spandan</string>
+    <!-- [Segment 36 release] "Spandan Anatomy", distinct from "Spandan" so
+         this build (applicationId com.spandan.app.anatomy) is identifiable
+         in the launcher/app list alongside the main com.spandan.app install,
+         not just non-colliding under the hood. -->
+    <string name="app_name">Spandan Anatomy</string>
 
     <string name="permission_rationale">Camera access is needed to capture your face for heart-rate and SpO2 estimation. No video is stored or sent anywhere.</string>
     <string name="grant_permission">Grant camera permission</string>

@@ -10,14 +10,21 @@
     <application
         android:allowBackup="true"
         android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:theme="@style/Theme.Spandan"
         android:supportsRtl="true">
         <!--
-          No android:icon set on purpose: this is a functional skeleton, not a
-          polished release, and shipping a placeholder launcher icon file
-          seemed like more clutter than value. The system falls back to a
-          default icon. Add a real one later via Android Studio's Image Asset
-          tool whenever the team wants app branding.
+          [Segment 36 release] A real launcher icon (orange background +
+          white pulse waveform, see drawable/ic_launcher_foreground.xml)
+          was added specifically so THIS build (applicationId
+          com.spandan.app.anatomy, distinct from com.spandan.app) installs
+          side by side with whatever is already on the device instead of
+          silently overwriting it, and is visually identifiable in the app
+          drawer at a glance. The previous "no icon, system default" choice
+          documented here (a functional-skeleton decision, not a bug) is
+          superseded for this branch, not deleted; see git history for the
+          original comment.
         -->
         <activity
             android:name=".MainActivity"

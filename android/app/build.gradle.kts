@@ -8,14 +8,23 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.spandan.app"
+        // [Segment 36 release] Deliberately DIFFERENT from the `namespace`
+        // above (com.spandan.app) -- applicationId, not namespace, is what
+        // Android uses to decide "same app, upgrade in place" vs. "different
+        // app, install side by side." This lets this build (with the new,
+        // not-yet-on-device-verified anatomy-ROI toggle) install alongside
+        // whatever com.spandan.app build is already on the device, rather
+        // than overwriting it. No Kotlin source package/namespace changed --
+        // this is the standard, minimal way to fork an installable identity
+        // without touching code structure.
+        applicationId = "com.spandan.app.anatomy"
         // CameraX and ML Kit Face Detection both support minSdk 21; 24 is used
         // here as a reasonable modern baseline for a course project, not a
         // hard library requirement.
         minSdk = 24
         targetSdk = 35
-        versionCode = 4
-        versionName = "1.3.0-live-signal"
+        versionCode = 5
+        versionName = "1.4.0-anatomy-roi"
     }
 
     buildTypes {
