@@ -21,7 +21,7 @@ function result = estimateVitalsAndMorphology(videoInput, groundTruth, calibPara
 % immediately before filtering/detrendSignal.m, useWaveletDenoise toggle,
 % default true) and into Android's RealHeartRateEstimator.kt. That
 % promotion was NEVER actually ported into this shared orchestrator --
-% the one function scripts/run_spandan_interactive.m and every other
+% the one function scripts/run_spandan_interactive_anatomy_roi.m and every other
 % current call site actually uses -- so every caller of THIS function
 % was silently running without wavelet denoising despite it being
 % documented project-wide as the production default. This fix closes
@@ -180,10 +180,58 @@ function result = estimateVitalsAndMorphology(videoInput, groundTruth, calibPara
 %                  computed and returned either way, only spo2Pct is NaN.
 %   opts         - (optional) struct, any subset of:
 %                    roiMode   - forwarded to roi/extractROISignals.m
-%                                when videoInput is a video path. Default
-%                                'forehead', matching every existing
-%                                production script -- never overridden
-%                                elsewhere in this project.
+%                                when videoInput is a video path AND
+%                                opts.useAnatomyROI is false. Default
+%                                'forehead'. Ignored when useAnatomyROI is
+%                                true (the current default -- see below).
+%                    useAnatomyROI - logical, default true (Segment 35
+%                                Phase 1 promotion, 2026-09-29). When true
+%                                and videoInput is a video path,
+%                                roi/faceMeshAnatomyROIExtraction.m
+%                                (MediaPipe FaceMesh-driven forehead+both-
+%                                malar ROI, Kim/Lee/Sohn 2021) replaces
+%                                roi/extractROISignals.m for the shared
+%                                ROI-extraction stage; opts.roiMode is then
+%                                ignored. REQUIRES
+%                                pyenv('ExecutionMode','OutOfProcess') to
+%                                already be set (or not yet loaded, in
+%                                which case this function sets it) --
+%                                MediaPipe's native bindings crash MATLAB's
+%                                default in-process Python. If pyenv was
+%                                already loaded in a different mode this
+%                                session (cannot be changed after the
+%                                fact), this errors with a clear message
+%                                rather than silently falling back --
+%                                matching this project's "never silently"
+%                                convention (see run_spandan_interactive_anatomy_roi.m
+%                                for the one place that DOES fall back,
+%                                deliberately, for presentation-safety
+%                                reasons stated in its own header).
+%                                PROMOTION EVIDENCE, STATED PLAINLY: on the
+%                                static/semi-natural pool (68/112 subjects,
+%                                5 UBFC + 63/107 VIPL v1), CHROM MAE
+%                                8.87->4.77bpm (Holm p=0.018), POS MAE
+%                                7.49->3.74bpm (Holm p=0.003) -- both
+%                                significant. On the motion pool (19/20
+%                                VIPL v2 subjects), CHROM MAE 7.63->4.54,
+%                                POS MAE 8.88->5.65, but the paired
+%                                Wilcoxon signed-rank test is NOT
+%                                significant (Holm p=0.215 both methods,
+%                                n=19 with only 7-8 non-zero pairs after
+%                                ties) -- this fails the phase's own
+%                                pre-registered promotion rule ("real,
+%                                Holm-corrected improvement on the MOTION
+%                                pool"). Promoted anyway by explicit
+%                                instruction (Abrar, 2026-09-29), NOT
+%                                because the motion-pool test passed.
+%                                Branch 2 notch confidence regresses under
+%                                this ROI (UBFC 4/5->2/5 pass the 0.3 bar),
+%                                same pattern every prior ROI-shape change
+%                                in this project has shown. Full detail:
+%                                matlab/docs/Segment35_MediaPipe_Anatomy_ROI.md.
+%                                Set to false to reproduce this function's
+%                                exact pre-2026-09-29 behavior (plain
+%                                face-box ROI via opts.roiMode).
 %                    beatOpts  - struct forwarded as-is to
 %                                morphology/ensembleAverageBeats.m's own
 %                                opts argument. Default struct() (that
@@ -296,6 +344,10 @@ if ~isfield(opts, 'roiMode') || isempty(opts.roiMode)
     opts.roiMode = 'forehead';
 end
 
+if ~isfield(opts, 'useAnatomyROI') || isempty(opts.useAnatomyROI)
+    opts.useAnatomyROI = true; % Segment 35 Phase 1 promotion (2026-09-29) -- see header note above
+end
+
 if ~isfield(opts, 'beatOpts') || isempty(opts.beatOpts)
     opts.beatOpts = struct();
 end
@@ -315,7 +367,15 @@ end
 % === Shared input stage: decode + extract ROI at most once. ===
 if ischar(videoInput) || isstring(videoInput)
     [frames, frameRate, ~] = loadUBFCVideo(char(videoInput));
-    [R, G, B, roiTimestamps, ~, ~] = extractROISignals(frames, frameRate, opts.roiMode);
+    if opts.useAnatomyROI
+        pe = pyenv();
+        if pe.Status == "NotLoaded"
+            pyenv('ExecutionMode', 'OutOfProcess');
+        end
+        [R, G, B, roiTimestamps, ~, ~] = faceMeshAnatomyROIExtraction(frames, frameRate);
+    else
+        [R, G, B, roiTimestamps, ~, ~] = extractROISignals(frames, frameRate, opts.roiMode);
+    end
 elseif isstruct(videoInput)
     if ~isfield(videoInput, 'R') || ~isfield(videoInput, 'G') || ~isfield(videoInput, 'B') || ~isfield(videoInput, 'fs')
         error('estimateVitalsAndMorphology:badCachedInput', 'videoInput struct must have fields R, G, B, and fs (e.g. a loaded <subjectID>_rgb_traces.mat).');

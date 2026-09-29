@@ -123,3 +123,71 @@ evidence that it needs a real calibration (Phase 5), not that it's currently bro
    just the two "locked" sessions to check.
 3. Schedule a real breath-hold data-collection session (Phase 5) — this is the only way the
    SpO2 reading can become a real measurement instead of a near-constant number.
+
+
+---
+
+## Addendum — pre-demo safety fix (2026-09-29, morning of the presentation)
+
+One additional short, safety-first session ran directly before the final presentation
+(live demo 2026-09-30), scoped to a single low-risk item rather than any new investigation.
+
+**What prompted it**: Phase 4 session 8 was thought to show a 153 bpm reading against an
+oximeter range of 79-85 bpm — a possible harmonic-doubling failure. **On closer check, this
+was not confirmed**: session 8's own CSV never logs HR above 130 bpm (it stays 64-105 bpm
+throughout), and the oximeter range compared against had been mixed up with session 4's.
+The theory has no confirmed supporting evidence from this project's own data.
+
+**What was still added, as a precaution**: a small, classical (no ML/DL) subharmonic-
+preference guard in `HeartRateFft.estimateBpm` — if a spectral peak near half the top
+peak's frequency holds a substantial share of its power and falls in a plausible
+resting-HR range, the lower (subharmonic) reading is preferred. This is a standard rPPG
+correction, not new architecture. Known, disclosed risk: it could incorrectly halve a
+genuine ~120 bpm reading if a strong 1 Hz component happens to be present. 4 new unit
+tests pass; the full suite is 100/100; the app builds and runs. Committed as `694daa2`.
+
+**One further on-device confirmation session** (107s, handheld, Galaxy A35, USB connected)
+ran cleanly afterward — no crash, HR stayed in a plausible 67-96 bpm range — but without a
+legible oximeter reading to compare against, so this confirms the build didn't break, not
+that the guard fixed anything real. Committed as `225bd20`. **Say so plainly if asked**:
+the guard is precautionary, not a confirmed fix for an observed failure.
+
+**Scope reminder, restated per Abrar's own clarification**: the oximeter viewing box
+(Phase 3) exists solely as an internal tool for Abrar's own future ground-truth data
+collection toward Phase 5's SpO2 calibration. It is not part of the demo and should not be
+shown to the course supervisor.
+
+---
+
+## Addendum 2 — Phase 1 finished, and promoted despite an inconclusive motion test (2026-09-29)
+
+This updates two things stated above as open: the "Recommendation: worth finishing" line in
+Phase 1, and "Nothing was promoted to a new default" in "What changed in the shipped app."
+Both are now out of date. Read this addendum alongside them, not in place of them (the
+history above stays visible, per this project's own record-keeping convention).
+
+**The motion-pool test finished.** After this document was first written, the same
+resumable script processed 19 of the 20 motion-condition subjects it had not yet reached
+(the 20th was left for a later session). The result points the same direction as Phase 1's
+main finding — roughly 40% lower heart-rate error with the new ROI — but **the formal
+statistical test on this specific motion result did not reach significance** (in plain
+terms: with this many subjects, and this many of them scoring identically either way, the
+improvement could plausibly be chance, even though the raw numbers look good). This was the
+exact test Phase 1 was designed to pass before recommending a change.
+
+**The new ROI was made the default anyway, by direct instruction, after seeing this exact
+result.** This affects the MATLAB research pipeline only — it is a research/desktop tool,
+not the phone app. **The Android app you will demo tomorrow is unaffected**: this ROI was
+never ported to the phone, and nothing about tomorrow's demo changes because of this
+promotion. The reason to record this plainly: if asked how confident this specific
+improvement is, the honest answer is "promising and consistent across two test pools, but
+the motion-specific test itself came back inconclusive, and it was adopted as a judgment
+call, not because every test passed."
+
+One more measurement was also added this same session: how well the waveform-shape
+(morphology) branch tracks a real reference pulse signal under the new ROI, on the 5
+subjects with that reference available. Unlike the notch-detection pass/fail rate (which
+dropped noticeably), this waveform-tracking measure barely moved either direction — a much
+smaller, mixed effect than the notch number alone might suggest.
+
+Full technical detail: `matlab/docs/Segment35_MediaPipe_Anatomy_ROI.md` §3.3-§3.6.

@@ -21,11 +21,57 @@ a chronological log of how each segment got here -- see the individual
 
 ## 2. Architecture: two branches, one shared ROI extraction
 
-Every stage of this pipeline starts the same way: `roi/extractROISignals.m`
+Every stage of this pipeline starts the same way: ~~`roi/extractROISignals.m`
 detects the face (Viola-Jones) and averages the forehead ROI's pixels into
 three raw color-channel traces, R(t)/G(t)/B(t), plus each frame's real
-acquisition timestamp. That single extraction feeds two independent
-branches, both implemented in `pipeline/estimateVitalsAndMorphology.m`:
+acquisition timestamp.~~ **[2026-09-29, Segment 35 Phase 1 promotion]**
+`roi/faceMeshAnatomyROIExtraction.m` (MediaPipe FaceMesh-driven forehead +
+both malar/cheekbone regions, Kim/Lee/Sohn 2021, with a classical YCbCr
+skin-tone pixel filter) is now the default (`opts.useAnatomyROI` in
+`pipeline/estimateVitalsAndMorphology.m`, `true`), replacing
+`roi/extractROISignals.m`'s plain face-box forehead crop; both still
+produce the same R(t)/G(t)/B(t) + per-frame timestamp interface downstream.
+**PROMOTED DESPITE A NON-SIGNIFICANT MOTION-POOL SIGNIFICANCE TEST** --
+stated plainly, not smoothed over. Evidence: on a 68-subject static/
+semi-natural pool (5 UBFC + 63/107 VIPL v1), CHROM MAE 8.87->4.77bpm (Holm
+p=0.018), POS MAE 7.49->3.74bpm (Holm p=0.003), both significant; on a
+19-subject VIPL v2 motion pool, CHROM MAE 7.63->4.54, POS 8.88->5.65, but
+the paired Holm-corrected Wilcoxon test is NOT significant (p=0.215 both
+methods -- too many exact ties leave only 7-8 non-zero pairs to test).
+This fails the phase's own pre-registered promotion rule ("real,
+Holm-corrected improvement on the MOTION pool"); promoted anyway by
+Abrar's explicit instruction after being shown this exact result. Branch 2
+notch confidence regresses under the new ROI (UBFC 4/5->2/5 pass the 0.3
+bar); Branch 2 waveform correlation with GT PPG moves only slightly and in
+both directions (mean 0.313->0.300 across 5 UBFC subjects, not a
+significance-tested claim at n=5). Set `opts.useAnatomyROI` to `false` to
+reproduce this document's pre-2026-09-29 numbers (Sections 3.2/5 below have
+NOT been regenerated under the new ROI -- a disclosed gap, see
+`matlab/docs/Segment35_MediaPipe_Anatomy_ROI.md` for the full evidence and
+what a full regeneration would need). That single extraction feeds two
+independent branches, both implemented in
+`pipeline/estimateVitalsAndMorphology.m`:
+
+**[2026-09-29, Segment 36] Video input robustness**: `io/loadUBFCVideo.m` and
+`io/loadVIPLVideo.m` now both call `io/ensureSDRVideo.m` (new) before ever
+opening a `VideoReader`. Prompted by the "Own Dataset" (9 subjects with real
+finger-PPG ground truth) turning out to be HEVC/10-bit/HLG (HDR) phone
+footage, one file also carrying rotation metadata `VideoReader` is confirmed
+(tested directly) to ignore -- neither failure crashes `VideoReader`, both
+silently produce wrong frames (sideways and/or un-tone-mapped) that would
+have fed CHROM/POS/the anatomy ROI wrong RGB data with no error raised.
+`ensureSDRVideo.m` probes via `ffprobe`; a file with no HDR transfer, no
+rotation flag, and a standard pixel format is returned completely unchanged
+(**verified a no-op for both UBFC and VIPL's own real video files** --
+UBFC: rawvideo/bgr24; VIPL: mjpeg/yuvj420p; neither has HDR transfer or a
+rotation flag), so this changes nothing for anything already validated. Only
+an actually non-standard file is tone-mapped (`zscale`+`tonemap=hable`) and/or
+re-encoded (`ffmpeg`'s own default auto-rotate handles rotation in the same
+pass) into a cached, gitignored `data/processed/_video_cache/` copy. If
+`ffprobe`/`ffmpeg` are not installed on a machine, this degrades gracefully
+to today's pre-existing behavior (uses the file as-is) rather than erroring.
+The standalone `scripts/run_spandan_interactive_anatomy_roi.m` carries its own verbatim
+embedded copy of the same function, per that file's "copy anywhere" design.
 
 - **Branch 1 (production HR/SpO2)** -- a narrow 0.7-4 Hz bandpass
   (`filtering/bandpassClean.m`), tuned for a clean FFT peak at the cardiac
@@ -100,6 +146,16 @@ chromCombine.m`, `pulseextraction/posCombine.m`, and
 
 **Heart rate**, pooled across all 112 available ground-truth subjects (5
 UBFC DATASET_1 + 107 VIPL-HR v1), `results/metrics/segment6_hr_pooled_metrics.csv`:
+
+**[2026-09-29] NOT YET REGENERATED under the anatomy ROI default (Section 2's
+promotion).** The table below still reflects `roi/extractROISignals.m`'s plain
+face-box ROI, computed before that promotion -- regenerating it requires a
+multi-hour MediaPipe batch over all 112 subjects, not done as part of this
+promotion (a disclosed gap, not hidden). The anatomy ROI's own partial-pool
+numbers (68/112 static + 19/20 motion, a DIFFERENT and smaller sample than the
+112 pooled here) are in `matlab/docs/Segment35_MediaPipe_Anatomy_ROI.md` §3.1/§3.3
+and are directionally much better, but are not directly comparable to this
+table's exact N=112 scope.
 
 **[2026-09-13] PROMOTED TO DEFAULT**: the table below is now WITH wavelet
 denoising (the pipeline default as of Section 3.1 above). ~~The pre-wavelet

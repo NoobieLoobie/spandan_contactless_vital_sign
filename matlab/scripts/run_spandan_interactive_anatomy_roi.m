@@ -1,4 +1,10 @@
-% RUN_SPANDAN_INTERACTIVE Interactive, single-video demo driver, TRULY
+% RUN_SPANDAN_INTERACTIVE_ANATOMY_ROI Interactive, single-video demo driver, TRULY
+% [2026-09-29, Segment 36] Renamed from run_spandan_interactive.m -- this is
+% now the matlab/ (ML/DL anatomy ROI) pipeline's own copy; the classical
+% (no ML/DL) sibling lives at matlab_classical/scripts/
+% run_spandan_interactive_classical.m. Renamed specifically so copying both
+% out of their directories (e.g. sending them to Abrar) never collides on
+% one filename -- see each directory's own PIPELINE_VARIANT.md.
 % STANDALONE: every pipeline function it calls is reproduced verbatim as a
 % local function in THIS file. No addpath, no repo checkout, no sibling
 % file or folder is needed beyond the video you pick (and, optionally,
@@ -265,13 +271,52 @@ faceDropWarning = '';
 fpsMismatchWarning = ''; % Case 3 only -- see checkFrameRateMismatch below
 subjectLabel = pickedLabel(videoPath);
 
+% [2026-09-29, Segment 35 Phase 1 promotion] MediaPipe anatomy ROI
+% (forehead+both malar) is now the DEFAULT ROI everywhere else in this
+% project (matlab/src/pipeline/estimateVitalsAndMorphology.m's own
+% opts.useAnatomyROI). It is attempted here too, but wrapped in a
+% best-effort probe + per-call fallback rather than a hard requirement --
+% this file's whole reason to exist is "copy anywhere, zero extra
+% dependency beyond standard MATLAB toolboxes" (see DESIGN HISTORY above),
+% and MediaPipe/Python is a real external dependency that promise never
+% included. If it's not available on this machine, or pyenv was already
+% loaded in a conflicting mode this session, this falls back to the
+% classical face-box ROI with a printed note rather than crashing --
+% matching this file's own "never crash in front of an audience"
+% philosophy (see the top-level safety net above). PROMOTION EVIDENCE,
+% STATED PLAINLY (matches estimateVitalsAndMorphology.m's own header):
+% static-pool CHROM MAE 8.87->4.77bpm (Holm p=0.018), POS 7.49->3.74bpm
+% (Holm p=0.003), both significant; motion-pool CHROM 7.63->4.54, POS
+% 8.88->5.65, but Holm p=0.215 both -- NOT significant, promoted anyway by
+% explicit instruction. Full detail:
+% matlab/docs/Segment35_MediaPipe_Anatomy_ROI.md.
+useAnatomyROI = true;
+anatomyROIAvailable = false;
+if useAnatomyROI
+    try
+        pe = pyenv();
+        if pe.Status == "NotLoaded"
+            pyenv('ExecutionMode', 'OutOfProcess');
+            pe = pyenv();
+        end
+        if pe.ExecutionMode == "OutOfProcess"
+            py.importlib.import_module('mediapipe');
+            anatomyROIAvailable = true;
+        else
+            disp('run_spandan_interactive: pyenv already loaded in a mode other than OutOfProcess this session -- anatomy ROI unavailable, falling back to the classical face-box ROI.');
+        end
+    catch anatomySetupErr
+        disp(['run_spandan_interactive: anatomy ROI unavailable (' anatomySetupErr.message ') -- falling back to the classical face-box ROI.']);
+    end
+end
+
 switch caseID
     case 1
         % --- UBFC-style: continuous ground truth available. ---
         gt = loadGroundTruth(gtPath, gtFormat);
 
         [frames, frameRate, numFrames] = loadUBFCVideo(videoPath);
-        [R, G, B, roiTimestamps, droppedFrameIdx, ~] = extractROISignals(frames, frameRate, 'forehead');
+        [R, G, B, roiTimestamps, droppedFrameIdx, ~] = extractROIWithAnatomyFallback(frames, frameRate, anatomyROIAvailable);
 
         rawGForDisplay = G; % TRUE raw (pre-wavelet) trace, kept only for panel (i) -- see runPipelineOnROI below
 
@@ -308,7 +353,7 @@ switch caseID
         viplRoot = fileparts(subjectFolderPath);
 
         [frames, frameRate, numFrames, ~] = loadVIPLVideo(viplRoot, subjectNum, scenarioNum, sourceNum);
-        [R, G, B, roiTimestamps, droppedFrameIdx, ~] = extractROISignals(frames, frameRate, 'forehead');
+        [R, G, B, roiTimestamps, droppedFrameIdx, ~] = extractROIWithAnatomyFallback(frames, frameRate, anatomyROIAvailable);
 
         rawGForDisplay = G;
 
@@ -345,7 +390,7 @@ switch caseID
             disp(['run_spandan_interactive: WARNING -- ' fpsMismatchWarning]);
         end
 
-        [R, G, B, roiTimestamps, droppedFrameIdx, ~] = extractROISignals(frames, frameRate, 'forehead');
+        [R, G, B, roiTimestamps, droppedFrameIdx, ~] = extractROIWithAnatomyFallback(frames, frameRate, anatomyROIAvailable);
 
         rawGForDisplay = G;
 
@@ -1855,7 +1900,253 @@ end
 end
 
 % =====================================================================
-% ROI EXTRACTION (verbatim from matlab/src/roi/extractROISignals.m)
+% ROI EXTRACTION -- ANATOMY ROI (Segment 35 Phase 1 promotion, 2026-09-29)
+% =====================================================================
+
+function [R, G, B, roiTimestamps, droppedFrameIdx, debugFrame] = extractROIWithAnatomyFallback(frames, frameRate, anatomyROIAvailable)
+% EXTRACTROIWITHANATOMYFALLBACK Tries faceMeshAnatomyROIExtraction (this
+% file's local copy, below) when anatomyROIAvailable is true; falls back
+% to the classical extractROISignals on any error (mid-run MediaPipe
+% failure on a specific clip, not just unavailability at session start --
+% see this function's caller for why this file treats that as a
+% fallback, not a fatal error, unlike matlab/src/'s own production
+% pipeline). frames.CurrentTime is reset to 0 before the fallback attempt
+% since the anatomy extractor may have partially consumed the stream.
+if anatomyROIAvailable
+    try
+        [R, G, B, roiTimestamps, droppedFrameIdx, debugFrame] = faceMeshAnatomyROIExtraction(frames, frameRate);
+        return;
+    catch anatomyRunErr
+        disp(['run_spandan_interactive: anatomy ROI failed for this clip (' anatomyRunErr.message ') -- falling back to the classical face-box ROI.']);
+        frames.CurrentTime = 0;
+    end
+end
+[R, G, B, roiTimestamps, droppedFrameIdx, debugFrame] = extractROISignals(frames, frameRate, 'forehead');
+end
+
+% =====================================================================
+% ROI EXTRACTION -- ANATOMY ROI internals (verbatim from
+% matlab/src/roi/faceMeshAnatomyROIExtraction.m)
+% =====================================================================
+
+function [R, G, B, roiTimestamps, droppedFrameIdx, debugFrame] = faceMeshAnatomyROIExtraction(frames, frameRate)
+% FACEMESHANATOMYROIEXTRACTION Verbatim copy of
+% matlab/src/roi/faceMeshAnatomyROIExtraction.m -- see that file's own
+% header for the full region/skin-filter rationale (Kim, Lee & Sohn 2021,
+% Sensors 21:7923). Requires pyenv('ExecutionMode','OutOfProcess'); this
+% file's caller (extractROIWithAnatomyFallback's own caller, above)
+% checks that before ever calling this function.
+
+pe = pyenv();
+if pe.ExecutionMode ~= "OutOfProcess"
+    error('faceMeshAnatomyROIExtraction:wrongExecutionMode', ...
+        'pyenv ExecutionMode is "%s", not "OutOfProcess".', char(pe.ExecutionMode));
+end
+
+mpModule = py.importlib.import_module('mediapipe');
+faceMeshModule = py.getattr(mpModule.solutions, 'face_mesh');
+faceMesh = faceMeshModule.FaceMesh(pyargs('static_image_mode', false, 'max_num_faces', int32(1), ...
+    'refine_landmarks', false, 'min_detection_confidence', 0.5, 'min_tracking_confidence', 0.5));
+
+lm.foreheadTop = 10;
+lm.leftBrowOuter = 105;
+lm.rightBrowOuter = 334;
+lm.leftUnderEye = 111;
+lm.leftNasolabial = 216;
+lm.leftCheekOuter = 137;
+lm.leftNoseAla = 129;
+lm.rightUnderEye = 340;
+lm.rightNasolabial = 436;
+lm.rightCheekOuter = 366;
+lm.rightNoseAla = 358;
+
+frames.CurrentTime = 0;
+numFrames = frames.NumFrames;
+
+R = zeros(1, numFrames);
+G = zeros(1, numFrames);
+B = zeros(1, numFrames);
+roiTimestamps = zeros(1, numFrames);
+frameDroppedFlag = false(1, numFrames);
+skinFilterSkippedFlag = false(1, numFrames);
+
+lastGoodLm = [];
+
+debugFrame = struct();
+debugFrame.image = [];
+debugFrame.foreheadBox = [];
+debugFrame.leftCheekBox = [];
+debugFrame.rightCheekBox = [];
+debugFrame.frameIndex = round(numFrames / 2);
+
+frameIdx = 0;
+
+while hasFrame(frames)
+    frameIdx = frameIdx + 1;
+    if frameIdx > numFrames
+        break
+    end
+
+    img = readFrame(frames);
+    [frameHeight, frameWidth, ~] = size(img);
+
+    pyImg = py.numpy.array(img);
+    detResult = faceMesh.process(pyImg);
+
+    frameDropped = false;
+
+    if isempty(detResult.multi_face_landmarks) || detResult.multi_face_landmarks == py.None
+        frameDropped = true;
+        currentLm = lastGoodLm;
+    else
+        faceLandmarks = detResult.multi_face_landmarks{1};
+        landmarkList = py.getattr(faceLandmarks, 'landmark');
+        localsDict = py.dict(pyargs('lm', landmarkList));
+        xyList = py.eval('[[p.x, p.y] for p in lm]', py.dict(), localsDict);
+        xyArray = double(py.numpy.array(xyList));
+        allX = xyArray(:, 1)' * frameWidth;
+        allY = xyArray(:, 2)' * frameHeight;
+        currentLm = struct('x', allX, 'y', allY);
+        lastGoodLm = currentLm;
+    end
+
+    if isempty(currentLm)
+        frameDropped = true;
+        [foreheadBox, leftCheekBox, rightCheekBox] = anatomyCenteredFallbackBoxes(frameWidth, frameHeight);
+    else
+        [foreheadBox, leftCheekBox, rightCheekBox] = anatomyLandmarksToBoxes(currentLm, lm, frameWidth, frameHeight);
+    end
+
+    frameDroppedFlag(frameIdx) = frameDropped;
+
+    [redPool, greenPool, bluePool, skippedFilter] = anatomyPoolSkinPixels(img, {foreheadBox, leftCheekBox, rightCheekBox});
+    skinFilterSkippedFlag(frameIdx) = skippedFilter;
+
+    R(frameIdx) = mean(redPool);
+    G(frameIdx) = mean(greenPool);
+    B(frameIdx) = mean(bluePool);
+    roiTimestamps(frameIdx) = (frameIdx - 1) / frameRate;
+
+    if frameIdx == debugFrame.frameIndex
+        debugFrame.image = img;
+        debugFrame.foreheadBox = foreheadBox;
+        debugFrame.leftCheekBox = leftCheekBox;
+        debugFrame.rightCheekBox = rightCheekBox;
+        debugFrame.frameIndex = frameIdx;
+    end
+end
+
+actualNumFrames = frameIdx;
+
+if actualNumFrames < numFrames
+    R = R(1:actualNumFrames);
+    G = G(1:actualNumFrames);
+    B = B(1:actualNumFrames);
+    roiTimestamps = roiTimestamps(1:actualNumFrames);
+    frameDroppedFlag = frameDroppedFlag(1:actualNumFrames);
+    skinFilterSkippedFlag = skinFilterSkippedFlag(1:actualNumFrames);
+end
+
+droppedFrameIdx = find(frameDroppedFlag);
+debugFrame.skinFilterSkippedIdx = find(skinFilterSkippedFlag);
+
+if isempty(debugFrame.image)
+    debugFrame.image = img;
+    debugFrame.foreheadBox = foreheadBox;
+    debugFrame.leftCheekBox = leftCheekBox;
+    debugFrame.rightCheekBox = rightCheekBox;
+    debugFrame.frameIndex = frameIdx;
+end
+
+end
+
+function [foreheadBox, leftCheekBox, rightCheekBox] = anatomyLandmarksToBoxes(currentLm, lm, frameWidth, frameHeight)
+x = currentLm.x; y = currentLm.y;
+
+fx1 = min(x(lm.leftBrowOuter + 1), x(lm.rightBrowOuter + 1));
+fx2 = max(x(lm.leftBrowOuter + 1), x(lm.rightBrowOuter + 1));
+fy2 = mean([y(lm.leftBrowOuter + 1), y(lm.rightBrowOuter + 1)]);
+fyTop = y(lm.foreheadTop + 1);
+fy1 = fyTop + 0.15 * (fy2 - fyTop);
+foreheadBox = anatomyClampBox([fx1, fy1, fx2 - fx1, fy2 - fy1], frameWidth, frameHeight);
+
+lx1 = min(x(lm.leftCheekOuter + 1), x(lm.leftNoseAla + 1));
+lx2 = max(x(lm.leftCheekOuter + 1), x(lm.leftNoseAla + 1));
+ly1 = y(lm.leftUnderEye + 1);
+ly2 = y(lm.leftNasolabial + 1);
+leftCheekBox = anatomyClampBox([lx1, min(ly1, ly2), lx2 - lx1, abs(ly2 - ly1)], frameWidth, frameHeight);
+
+rx1 = min(x(lm.rightNoseAla + 1), x(lm.rightCheekOuter + 1));
+rx2 = max(x(lm.rightNoseAla + 1), x(lm.rightCheekOuter + 1));
+ry1 = y(lm.rightUnderEye + 1);
+ry2 = y(lm.rightNasolabial + 1);
+rightCheekBox = anatomyClampBox([rx1, min(ry1, ry2), rx2 - rx1, abs(ry2 - ry1)], frameWidth, frameHeight);
+end
+
+function [foreheadBox, leftCheekBox, rightCheekBox] = anatomyCenteredFallbackBoxes(frameWidth, frameHeight)
+cx = 0.5 * frameWidth;
+foreheadBox = anatomyClampBox([cx - 0.12 * frameWidth, 0.18 * frameHeight, 0.24 * frameWidth, 0.10 * frameHeight], frameWidth, frameHeight);
+leftCheekBox = anatomyClampBox([cx - 0.30 * frameWidth, 0.32 * frameHeight, 0.12 * frameWidth, 0.10 * frameHeight], frameWidth, frameHeight);
+rightCheekBox = anatomyClampBox([cx + 0.18 * frameWidth, 0.32 * frameHeight, 0.12 * frameWidth, 0.10 * frameHeight], frameWidth, frameHeight);
+end
+
+function bbox = anatomyClampBox(rawBox, frameWidth, frameHeight)
+x1 = max(1, round(rawBox(1)));
+y1 = max(1, round(rawBox(2)));
+x2 = min(frameWidth, round(rawBox(1) + rawBox(3)));
+y2 = min(frameHeight, round(rawBox(2) + rawBox(4)));
+x2 = max(x2, x1 + 1);
+y2 = max(y2, y1 + 1);
+bbox = [x1, y1, x2 - x1, y2 - y1];
+end
+
+function [redPool, greenPool, bluePool, skippedFilter] = anatomyPoolSkinPixels(img, boxes)
+redPool = [];
+greenPool = [];
+bluePool = [];
+boxPatches = cell(1, numel(boxes));
+skinMasks = cell(1, numel(boxes));
+anyTooFew = false;
+
+for k = 1:numel(boxes)
+    b = boxes{k};
+    x1 = b(1); y1 = b(2); x2 = x1 + b(3); y2 = y1 + b(4);
+    patch = img(y1:y2, x1:x2, :);
+    boxPatches{k} = patch;
+    mask = anatomyYcbcrSkinMask(patch);
+    skinMasks{k} = mask;
+    if nnz(mask) < 0.10 * numel(mask)
+        anyTooFew = true;
+    end
+end
+
+skippedFilter = anyTooFew;
+
+for k = 1:numel(boxes)
+    patch = boxPatches{k};
+    if skippedFilter
+        mask = true(size(patch, 1), size(patch, 2));
+    else
+        mask = skinMasks{k};
+    end
+    rC = double(patch(:, :, 1));
+    gC = double(patch(:, :, 2));
+    bC = double(patch(:, :, 3));
+    redPool = [redPool; rC(mask)]; %#ok<AGROW>
+    greenPool = [greenPool; gC(mask)]; %#ok<AGROW>
+    bluePool = [bluePool; bC(mask)]; %#ok<AGROW>
+end
+end
+
+function mask = anatomyYcbcrSkinMask(patch)
+ycbcr = rgb2ycbcr(patch);
+Cb = double(ycbcr(:, :, 2));
+Cr = double(ycbcr(:, :, 3));
+mask = (Cb >= 77 & Cb <= 127) & (Cr >= 133 & Cr <= 173);
+end
+
+% =====================================================================
+% ROI EXTRACTION -- CLASSICAL FALLBACK (verbatim from matlab/src/roi/extractROISignals.m)
 % =====================================================================
 
 function [R, G, B, roiTimestamps, droppedFrameIdx, debugFrame] = extractROISignals(frames, frameRate, roiMode)
@@ -2032,12 +2323,16 @@ end
 function [frames, frameRate, numFrames] = loadUBFCVideo(videoPath)
 % LOADUBFCVIDEO Generic VideoReader wrapper (the name is historical --
 % used for UBFC-style AND arbitrary/Case-3 videos, see this file's own
-% Case 3 comment). Verbatim copy of matlab/src/io/loadUBFCVideo.m.
+% Case 3 comment). Verbatim copy of matlab/src/io/loadUBFCVideo.m
+% (2026-09-29: now normalizes HDR/rotated/non-standard input via
+% ensureSDRVideo below, so "pick any video" genuinely means any video --
+% see that function's own header for why this was needed).
 if ~isfile(videoPath)
     error('loadUBFCVideo:fileNotFound', 'Video file not found: %s', videoPath);
 end
 
-frames = VideoReader(videoPath);
+readablePath = ensureSDRVideo(videoPath);
+frames = VideoReader(readablePath);
 frameRate = frames.FrameRate;
 numFrames = frames.NumFrames;
 end
@@ -2066,7 +2361,8 @@ if ~isfile(videoPath)
     error('loadVIPLVideo:fileNotFound', 'Video file not found: %s', videoPath);
 end
 
-frames = VideoReader(videoPath);
+readablePath = ensureSDRVideo(videoPath);
+frames = VideoReader(readablePath);
 containerFrameRate = frames.FrameRate;
 numFrames = frames.NumFrames;
 
@@ -2095,6 +2391,114 @@ else
     disp(['loadVIPLVideo: no time.txt for source' num2str(sourceNum) ' (' videoPath '), using container FrameRate = ' num2str(containerFrameRate) ' fps -- known accuracy limitation for source2.']);
     frameRate = containerFrameRate;
 end
+end
+
+function outPath = ensureSDRVideo(inPath)
+% ENSURESDRVIDEO Verbatim copy of matlab/src/io/ensureSDRVideo.m -- see
+% that file's own header for the full rationale (HDR/HLG phone video +
+% rotation-metadata robustness). Ffprobe/ffmpeg-based; gracefully returns
+% inPath unchanged if either tool is missing or normalization fails --
+% never crashes this file's own "never crash in front of an audience"
+% guarantee. Confirmed a no-op for UBFC/VIPL-style input.
+outPath = inPath;
+
+if ~isfile(inPath)
+    return;
+end
+
+[ffprobeOk, ~] = system('where ffprobe');
+[ffmpegOk, ~] = system('where ffmpeg');
+if ffprobeOk ~= 0 || ffmpegOk ~= 0
+    disp('ensureSDRVideo: ffprobe/ffmpeg not found -- skipping video normalization (using the file as-is).');
+    return;
+end
+
+probeCmd = sprintf('ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt,color_transfer:stream_side_data=rotation -of json "%s"', inPath);
+[probeStatus, probeOut] = system(probeCmd);
+if probeStatus ~= 0
+    disp(['ensureSDRVideo: ffprobe failed on ' inPath ' -- skipping normalization.']);
+    return;
+end
+
+try
+    probeInfo = jsondecode(probeOut);
+    streamInfo = probeInfo.streams(1);
+catch
+    disp(['ensureSDRVideo: could not parse ffprobe output for ' inPath ' -- skipping normalization.']);
+    return;
+end
+
+pixFmt = '';
+if isfield(streamInfo, 'pix_fmt')
+    pixFmt = streamInfo.pix_fmt;
+end
+colorTransfer = '';
+if isfield(streamInfo, 'color_transfer')
+    colorTransfer = streamInfo.color_transfer;
+end
+
+isHDR = any(strcmpi(colorTransfer, {'arib-std-b67', 'smpte2084', 'smpte428'}));
+hasUnusualPixFmt = contains(pixFmt, '10le') || contains(pixFmt, '12le') || contains(pixFmt, 'p010') || contains(pixFmt, 'p012');
+
+hasRotation = false;
+if isfield(streamInfo, 'side_data_list')
+    sideDataList = streamInfo.side_data_list;
+    if ~iscell(sideDataList)
+        sideDataList = {sideDataList};
+    end
+    for k = 1:numel(sideDataList)
+        sd = sideDataList{k};
+        if isstruct(sd) && isfield(sd, 'rotation') && sd.rotation ~= 0
+            hasRotation = true;
+        end
+    end
+end
+
+if ~(isHDR || hasUnusualPixFmt || hasRotation)
+    return; % fast path -- UBFC/VIPL-style input lands here, unchanged
+end
+
+disp(['ensureSDRVideo: ' inPath ' needs normalization (HDR transfer=' colorTransfer ', pix_fmt=' pixFmt ', rotation flag=' num2str(hasRotation) ') -- tone-mapping/re-encoding via ffmpeg.']);
+
+[cacheDir, ~, ~] = fileparts(inPath);
+cacheDir = fullfile(cacheDir, '_sdr_video_cache');
+if ~isfolder(cacheDir)
+    mkdir(cacheDir);
+end
+
+fileInfo = dir(inPath);
+cacheKeyString = sprintf('%s|%d|%f', inPath, fileInfo.bytes, fileInfo.datenum);
+md = java.security.MessageDigest.getInstance('MD5');
+hashBytes = typecast(md.digest(uint8(cacheKeyString)), 'uint8');
+hashHex = lower(sprintf('%02x', hashBytes));
+cachedPath = fullfile(cacheDir, ['sdr_' hashHex '.mp4']);
+
+if isfile(cachedPath)
+    outPath = cachedPath;
+    return;
+end
+
+if isHDR
+    filterChain = 'zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=full,format=yuv420p';
+else
+    filterChain = 'format=yuv420p';
+end
+
+tempOutPath = [cachedPath '.tmp.mp4'];
+encodeCmd = sprintf('ffmpeg -y -i "%s" -vf "%s" -c:v libx264 -preset veryfast -crf 18 -an "%s"', inPath, filterChain, tempOutPath);
+[encodeStatus, encodeOut] = system(encodeCmd);
+
+if encodeStatus ~= 0 || ~isfile(tempOutPath)
+    disp(['ensureSDRVideo: ffmpeg normalization FAILED for ' inPath ' -- using the original file as-is. ffmpeg output: ' encodeOut(max(1, end - 500):end)]);
+    if isfile(tempOutPath)
+        delete(tempOutPath);
+    end
+    return;
+end
+
+movefile(tempOutPath, cachedPath);
+outPath = cachedPath;
+disp(['ensureSDRVideo: normalized copy cached at ' cachedPath]);
 end
 
 function gt = loadGroundTruth(gtPath, datasetFormat)

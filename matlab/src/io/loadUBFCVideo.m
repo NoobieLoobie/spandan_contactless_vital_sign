@@ -27,7 +27,14 @@ if ~isfile(videoPath)
     error('loadUBFCVideo:fileNotFound', 'Video file not found: %s', videoPath);
 end
 
-frames = VideoReader(videoPath);
+% [2026-09-29] io/ensureSDRVideo.m normalizes HDR/rotated/non-standard
+% input (verified a no-op for every video this project has validated on --
+% see that function's own header) before VideoReader ever opens it. This
+% is the "generic any-video" loader (run_spandan_interactive_anatomy_roi.m Case 3,
+% scripts/run_segment2_roi_batch.m), so it is the natural place for this.
+readablePath = ensureSDRVideo(videoPath);
+
+frames = VideoReader(readablePath);
 frameRate = frames.FrameRate;
 numFrames = frames.NumFrames;
 

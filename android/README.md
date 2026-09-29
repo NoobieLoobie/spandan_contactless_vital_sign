@@ -1168,3 +1168,46 @@ and a per-frame calibration CSV recorder with breath-hold event markers.
 
 Full detail, the capability table, the CSV schema and the known limitations:
 [`docs/Segment34_SpO2_Oximetry_Capture.md`](docs/Segment34_SpO2_Oximetry_Capture.md).
+
+## Segment 36 -- MediaPipe FaceLandmarker anatomy-ROI port + on/off toggle
+
+Run 2026-09-29, no physical device this session (none attached, no `adb` found either).
+Ports `matlab/src/roi/faceMeshAnatomyROIExtraction.m` (Segment 35's promoted anatomy ROI --
+forehead + both malar/cheekbone regions, landmark-driven, with a YCbCr skin-pixel filter)
+to Android via MediaPipe Tasks Vision's `FaceLandmarker`, behind a real user-facing toggle
+(top-end of the camera preview, "Anatomy ROI", off by default) rather than a fixed choice --
+Segment 36's own MATLAB half (`../matlab/docs/Segment36_Own_Dataset_Evaluation.md`) found a
+real accuracy regression on POS on an independent dataset, so this is deliberately an
+experimental comparison control, not a new validated default.
+
+- **New**: `camera/AnatomyRoiCalculator.kt` (pure landmark->box math), `camera/
+  AnatomyRoiPixelAverager.kt` (pure YCbCr skin-filtered pixel averaging), `camera/
+  AnatomyRoiFaceAnalyzer.kt` (the `ImageAnalysis.Analyzer`, MediaPipe FaceLandmarker
+  LIVE_STREAM), `camera/MediaPipeImageConverter.kt` (copied from the Segment 30 MediaPipe
+  experiment, not previously in production `android/`), `assets/face_landmarker.task`
+  (MediaPipe's official model, verified a real bundle before committing).
+- **Read Segment 30's own MediaPipe work first, per instruction**: reused its YUV->Bitmap
+  conversion fix (MediaPipe's Android packet creator rejects raw YUV_420_888) and its real
+  fps-cost finding (bitmap conversion dominates bundled detection cost) as a disclosed,
+  accepted cost of this opt-in toggle. Segment 30 had deliberately AVOIDED FaceLandmarker,
+  citing a different, KLT-tracking-specific negative MATLAB finding
+  (`matlab/docs/Segment7_Task_D_Landmark_ROI.md`) that does not apply to this port's
+  per-detection-frame (not tracked) approach -- see the full doc for why these are
+  different premises, not a silent reversal of Segment 30's own decision.
+- **Design choice**: pre-rotates the converted Bitmap to upright BEFORE calling
+  FaceLandmarker (rather than Segment 30's own "raw bitmap + rotation hint, un-rotate the
+  result after" pattern) -- avoids needing a landmark-specific coordinate mapper for 9
+  independent points, and matches `faceMeshAnatomyROIExtraction.m`'s own convention
+  directly (an already-upright MATLAB `VideoReader` frame).
+- **Two real bugs found and fixed** (both are real-device-harmless, test-harness-only
+  traps -- see the full doc): `Rect.equals()` is ALSO stubbed under this project's plain-
+  JUnit harness (not just the already-known 4-arg constructor), and `Rect.width()`/
+  `height()` are ALSO stubbed to 0 (unlike the real `.left`/`.top`/`.right`/`.bottom`
+  fields) -- the latter was a genuine production bug in the skin-pixel-floor check,
+  caught because a test failed for the right reason instead of silently passing.
+- **111/111 unit tests pass** (12 new), `assembleDebug` succeeds.
+- **Honest status**: code complete, NOT on-device verified this session. Real fps cost,
+  crash-on-launch risk, and whether the pre-rotate coordinate convention actually lands
+  landmarks correctly on a real face are all open questions for the next device session.
+
+Full detail: [`docs/Segment36_Anatomy_ROI_Port.md`](docs/Segment36_Anatomy_ROI_Port.md).

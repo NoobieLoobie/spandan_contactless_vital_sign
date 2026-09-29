@@ -93,6 +93,9 @@
     <string name="morphology_method_gaussian">Gaussian (α=0.15)</string>
     <string name="morphology_no_notch">No notch detected this window</string>
 
+    <!-- [Segment 36] User-facing toggle, top-end of the camera preview. -->
+    <string name="anatomy_roi_toggle_label">Anatomy ROI</string>
+
     <!-- [Segment 34] developer calibration panel (long-press the vitals card).
          Not user-facing; see docs/Segment34_SpO2_Oximetry_Capture.md. -->
     <string name="cal_elapsed_idle">--:--.-</string>

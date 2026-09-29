@@ -33,6 +33,7 @@ import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import com.spandan.app.camera.AnatomyRoiFaceAnalyzer
 import com.spandan.app.camera.CoordinateMapper
 import com.spandan.app.camera.FaceAnalysisResult
 import com.spandan.app.camera.FaceAnalyzer
@@ -130,6 +131,20 @@ class MainActivity : AppCompatActivity() {
     // developer panel (long-press the vitals card). When off, the camera is
     // configured exactly as before -- the controller only reads capture
     // results. The displayed SpO2 formula is NOT changed by any of this.
+    // [Segment 36] MediaPipe FaceLandmarker anatomy ROI toggle. OFF by
+    // default (ANATOMY_ROI_DEFAULT) -- an experimental, user-switchable
+    // alternative to FaceAnalyzer's classical face-box ROI, not a validated
+    // default (see the toggle's own layout XML comment for why). Holds the
+    // currently-bound [AnatomyRoiFaceAnalyzer] (nullable: only constructed
+    // while the toggle is on) so its native MediaPipe resources can be
+    // explicitly closed on every rebind that turns the toggle off or
+    // switches back to it -- unlike FaceAnalyzer/AnatomyRoiFaceAnalyzer's
+    // own documented "nothing currently calls close()" gap for the
+    // process-lifetime case, a toggle that flips repeatedly during one
+    // session should not leak a new native task graph every time.
+    private var useAnatomyRoi = ANATOMY_ROI_DEFAULT
+    private var activeAnatomyAnalyzer: AnatomyRoiFaceAnalyzer? = null
+    private lateinit var anatomyRoiSwitch: SwitchCompat
     private var useOximetryCapture = USE_OXIMETRY_CAPTURE_DEFAULT
     private val oximetry = OximetryCaptureController().apply {
         // [Segment 35 Phase 2 item 5] an exposure/WB step at re-lock hits
@@ -193,6 +208,19 @@ class MainActivity : AppCompatActivity() {
         morphologyWaveformView = findViewById(R.id.morphologyWaveformView)
         morphologyStatusDot = findViewById(R.id.morphologyStatusDot)
         morphologyStatusLabel = findViewById(R.id.morphologyStatusLabel)
+        anatomyRoiSwitch = findViewById(R.id.anatomyRoiSwitch)
+        anatomyRoiSwitch.isChecked = useAnatomyRoi
+        anatomyRoiSwitch.setOnCheckedChangeListener { _, checked ->
+            if (checked == useAnatomyRoi) return@setOnCheckedChangeListener
+            useAnatomyRoi = checked
+            // Same reasoning as oximetrySwitch's own listener: switching ROI
+            // source is a step change in the input signal, not a smooth
+            // transition -- clear the window so HR/SpO2/morphology restart
+            // on consistent data rather than mixing pre/post-toggle samples.
+            signalBuffer.clear()
+            hrDisplaySmoother.reset()
+            bindUseCases()
+        }
         setUpCalibrationPanel()
 
         // App targets SDK 35, where edge-to-edge is enforced -- content draws
@@ -316,22 +344,41 @@ class MainActivity : AppCompatActivity() {
 
         val analysis = analysisBuilder.build()
 
-        val analyzer = FaceAnalyzer { result ->
+        // [Segment 36] Close any previously-bound anatomy analyzer's native
+        // MediaPipe resources before (possibly) building a new one -- every
+        // bindUseCases() call fully rebuilds the analyzer, so without this a
+        // repeated toggle flip would leak one task graph per flip.
+        activeAnatomyAnalyzer?.close()
+        activeAnatomyAnalyzer = null
+
+        val resultCallback: (FaceAnalysisResult) -> Unit = { result ->
             // Analyzer callback runs on analysisExecutor; hop back to the
             // main thread before touching any views.
             uiHandler.post { handleAnalysisResult(result) }
         }
-        // [Segment 34] zeroLightMeter.offer is a no-op unless the developer
-        // zero-light measurement is running.
-        analysis.setAnalyzer(analysisExecutor) { imageProxy ->
-            zeroLightMeter.offer(imageProxy)
-            // [Segment 35 Phase 3] reads imageProxy.image synchronously,
-            // strictly BEFORE analyzer.analyze(imageProxy) below (whose
-            // async detection paths eventually call imageProxy.close() on a
-            // different thread/callback) -- safe regardless of which of
-            // FaceAnalyzer's several close() call sites ends up firing.
-            offerOximeterGuideCrop(imageProxy)
-            analyzer.analyze(imageProxy)
+
+        if (useAnatomyRoi) {
+            val anatomyAnalyzer = AnatomyRoiFaceAnalyzer(this, resultCallback)
+            activeAnatomyAnalyzer = anatomyAnalyzer
+            analysis.setAnalyzer(analysisExecutor) { imageProxy ->
+                zeroLightMeter.offer(imageProxy)
+                offerOximeterGuideCrop(imageProxy)
+                anatomyAnalyzer.analyze(imageProxy)
+            }
+        } else {
+            val analyzer = FaceAnalyzer(onResult = resultCallback)
+            // [Segment 34] zeroLightMeter.offer is a no-op unless the developer
+            // zero-light measurement is running.
+            analysis.setAnalyzer(analysisExecutor) { imageProxy ->
+                zeroLightMeter.offer(imageProxy)
+                // [Segment 35 Phase 3] reads imageProxy.image synchronously,
+                // strictly BEFORE analyzer.analyze(imageProxy) below (whose
+                // async detection paths eventually call imageProxy.close() on a
+                // different thread/callback) -- safe regardless of which of
+                // FaceAnalyzer's several close() call sites ends up firing.
+                offerOximeterGuideCrop(imageProxy)
+                analyzer.analyze(imageProxy)
+            }
         }
 
         try {
@@ -894,6 +941,15 @@ class MainActivity : AppCompatActivity() {
          *  docs/Segment34_SpO2_Oximetry_Capture.md. Switchable at runtime from
          *  the developer calibration panel (long-press the vitals card). */
         private const val USE_OXIMETRY_CAPTURE_DEFAULT = false
+
+        /** [Segment 36] OFF by default: MediaPipe FaceLandmarker anatomy ROI
+         *  is a new, not on-device-verified port this session, and its own
+         *  MATLAB source (Segment 35's promotion) has a disclosed real
+         *  regression on POS accuracy in the Own Dataset follow-up
+         *  (matlab/docs/Segment36_Own_Dataset_Evaluation.md) -- an
+         *  experimental user toggle, not a validated default. Switchable at
+         *  runtime from the top-end camera-preview switch (anatomyRoiSwitch). */
+        private const val ANATOMY_ROI_DEFAULT = false
 
         private const val ZERO_LIGHT_TAG = "SPANDAN_ZERO_LIGHT"
 

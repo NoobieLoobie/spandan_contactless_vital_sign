@@ -69,8 +69,31 @@
 % to produce the ablation this promotion is based on (see
 % docs/Segment8_Task4_Wavelet_Denoise_Ablation.md). Toggle
 % useWaveletDenoise below to false to reproduce the pre-wavelet numbers.
+%
+% [2026-09-29] Segment 35 Phase 1's MediaPipe anatomy ROI (forehead+both
+% malar, roi/faceMeshAnatomyROIExtraction.m) is now this script's default
+% too, replacing roi/extractROISignals.m's plain face-box ROI -- promoted
+% despite a NON-significant motion-pool Wilcoxon test (Holm p=0.215 both
+% CHROM/POS; the significant result is on the static/semi-natural pool
+% only, CHROM MAE 8.87->4.77bpm p=0.018, POS 7.49->3.74bpm p=0.003), by
+% explicit instruction. See matlab/docs/Segment35_MediaPipe_Anatomy_ROI.md
+% for the full evidence and caveats. REQUIRES a working MediaPipe Python
+% install; this script sets pyenv('ExecutionMode','OutOfProcess') itself
+% below if not already loaded. Toggle useAnatomyROI to false to reproduce
+% the pre-2026-09-29 plain-box-ROI numbers (this is what every existing
+% results/metrics/segment4_hr_summary_vipl.csv / segment6_*.csv row still
+% reflects -- this promotion has NOT yet been used to regenerate those,
+% a disclosed follow-up, not done as part of this promotion).
 
 useWaveletDenoise = true;
+useAnatomyROI = true;
+
+if useAnatomyROI
+    pe = pyenv();
+    if pe.Status == "NotLoaded"
+        pyenv('ExecutionMode', 'OutOfProcess');
+    end
+end
 
 subjectTriples = [
     1, 1, 1
@@ -230,7 +253,11 @@ for subjectPos = 1:numSubjects
 
         disp([subjectID ': loaded ' videoPath ', fs = ' num2str(fs) ' fps, numFrames = ' num2str(numFrames)]);
 
-        [R, G, B, roiTimestamps, droppedFrameIdx, debugFrame] = extractROISignals(videoReaderObj, fs);
+        if useAnatomyROI
+            [R, G, B, roiTimestamps, droppedFrameIdx, debugFrame] = faceMeshAnatomyROIExtraction(videoReaderObj, fs);
+        else
+            [R, G, B, roiTimestamps, droppedFrameIdx, debugFrame] = extractROISignals(videoReaderObj, fs);
+        end
 
         numDroppedFrames = numel(droppedFrameIdx);
 
@@ -241,8 +268,17 @@ for subjectPos = 1:numSubjects
 
         disp([subjectID ': saved ' rgbMatOutPath]);
 
-        annotatedImg = insertObjectAnnotation(debugFrame.image, 'rectangle', debugFrame.faceBBox, 'Detected Face', 'Color', 'yellow', 'LineWidth', 3);
-        annotatedImg = insertObjectAnnotation(annotatedImg, 'rectangle', debugFrame.roiBBox, 'ROI (forehead)', 'Color', 'green', 'LineWidth', 3);
+        if useAnatomyROI
+            % faceMeshAnatomyROIExtraction.m's debugFrame has three named
+            % boxes (forehead/leftCheek/rightCheek), not extractROISignals.m's
+            % faceBBox/roiBBox -- annotate all three instead.
+            annotatedImg = insertObjectAnnotation(debugFrame.image, 'rectangle', debugFrame.foreheadBox, 'Forehead', 'Color', 'green', 'LineWidth', 3);
+            annotatedImg = insertObjectAnnotation(annotatedImg, 'rectangle', debugFrame.leftCheekBox, 'L Cheek', 'Color', 'cyan', 'LineWidth', 3);
+            annotatedImg = insertObjectAnnotation(annotatedImg, 'rectangle', debugFrame.rightCheekBox, 'R Cheek', 'Color', 'cyan', 'LineWidth', 3);
+        else
+            annotatedImg = insertObjectAnnotation(debugFrame.image, 'rectangle', debugFrame.faceBBox, 'Detected Face', 'Color', 'yellow', 'LineWidth', 3);
+            annotatedImg = insertObjectAnnotation(annotatedImg, 'rectangle', debugFrame.roiBBox, 'ROI (forehead)', 'Color', 'green', 'LineWidth', 3);
+        end
 
         roiPngOutPath = fullfile(figuresRoot, [subjectID '_roi_sanity.png']);
         imwrite(annotatedImg, roiPngOutPath);

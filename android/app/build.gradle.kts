@@ -70,6 +70,18 @@ dependencies {
     // a lab demo) ---
     implementation("com.google.mlkit:face-detection:16.1.7")
 
+    // --- MediaPipe Tasks Vision (Segment 36): FaceLandmarker, gated behind
+    // the "anatomy ROI" toggle (MainActivity's anatomyRoiSwitch), OFF by
+    // default. Same artifact android_segment30_mediapipe/ already used for
+    // its own (rejected, on different grounds -- see AnatomyRoiFaceAnalyzer.kt's
+    // own KDoc) FaceDetector experiment; verified against the real
+    // maven-metadata.xml there, not guessed. Ships the app's own APK size up
+    // (native .so + the bundled face_landmarker.task model, ~3.75MB, in
+    // assets/) regardless of whether the toggle is ever switched on, since
+    // Gradle has no per-flag dependency exclusion -- a real, accepted cost
+    // of adding the toggle at all, not hidden.
+    implementation("com.google.mediapipe:tasks-vision:1.0.0")
+
     // --- JTransforms: real FFT for signal/HeartRateFft.kt (matlab/src/heartrate/
     // fftHeartRate.m ported) --- added now that a real FFT step actually exists;
     // previously deferred (see android/README.md history) while HR was a placeholder.

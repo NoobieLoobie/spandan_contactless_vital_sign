@@ -22,6 +22,27 @@
 % halting the whole batch. A summary of any failures is printed at the
 % end.
 
+% [2026-09-29] Segment 35 Phase 1's MediaPipe anatomy ROI
+% (roi/faceMeshAnatomyROIExtraction.m, forehead+both malar) is now this
+% script's default, replacing roi/extractROISignals.m's plain face-box
+% ROI -- promoted despite a NON-significant motion-pool Wilcoxon test
+% (Holm p=0.215 both CHROM/POS); the significant result is on the
+% static/semi-natural pool only (CHROM MAE 8.87->4.77bpm p=0.018, POS
+% 7.49->3.74bpm p=0.003). Promoted by explicit instruction, not because
+% the motion-pool test passed. See
+% matlab/docs/Segment35_MediaPipe_Anatomy_ROI.md. REQUIRES a working
+% MediaPipe Python install; pyenv is set to OutOfProcess below if not
+% already loaded. Toggle useAnatomyROI to false to reproduce the
+% pre-2026-09-29 plain-box-ROI numbers.
+useAnatomyROI = true;
+
+if useAnatomyROI
+    pe = pyenv();
+    if pe.Status == "NotLoaded"
+        pyenv('ExecutionMode', 'OutOfProcess');
+    end
+end
+
 datasetName = 'DATASET_1';
 subjectList = {'5-gt', '6-gt', '7-gt'};
 
@@ -62,7 +83,11 @@ for subjectPos = 1:numSubjects
 
         disp(['Subject ' subjectID ': fs = ' num2str(fs) ' fps, numFrames = ' num2str(numFrames)]);
 
-        [R, G, B, roiTimestamps, droppedFrameIdx, debugFrame] = extractROISignals(videoReaderObj, fs);
+        if useAnatomyROI
+            [R, G, B, roiTimestamps, droppedFrameIdx, debugFrame] = faceMeshAnatomyROIExtraction(videoReaderObj, fs);
+        else
+            [R, G, B, roiTimestamps, droppedFrameIdx, debugFrame] = extractROISignals(videoReaderObj, fs);
+        end
 
         numDroppedFrames = numel(droppedFrameIdx);
 
@@ -73,8 +98,14 @@ for subjectPos = 1:numSubjects
 
         disp(['Subject ' subjectID ': saved ' matOutPath]);
 
-        annotatedImg = insertObjectAnnotation(debugFrame.image, 'rectangle', debugFrame.faceBBox, 'Detected Face', 'Color', 'yellow', 'LineWidth', 3);
-        annotatedImg = insertObjectAnnotation(annotatedImg, 'rectangle', debugFrame.roiBBox, 'ROI (forehead)', 'Color', 'green', 'LineWidth', 3);
+        if useAnatomyROI
+            annotatedImg = insertObjectAnnotation(debugFrame.image, 'rectangle', debugFrame.foreheadBox, 'Forehead', 'Color', 'green', 'LineWidth', 3);
+            annotatedImg = insertObjectAnnotation(annotatedImg, 'rectangle', debugFrame.leftCheekBox, 'L Cheek', 'Color', 'cyan', 'LineWidth', 3);
+            annotatedImg = insertObjectAnnotation(annotatedImg, 'rectangle', debugFrame.rightCheekBox, 'R Cheek', 'Color', 'cyan', 'LineWidth', 3);
+        else
+            annotatedImg = insertObjectAnnotation(debugFrame.image, 'rectangle', debugFrame.faceBBox, 'Detected Face', 'Color', 'yellow', 'LineWidth', 3);
+            annotatedImg = insertObjectAnnotation(annotatedImg, 'rectangle', debugFrame.roiBBox, 'ROI (forehead)', 'Color', 'green', 'LineWidth', 3);
+        end
 
         pngOutPath = fullfile(figuresRoot, [subjectID '_roi_sanity.png']);
         imwrite(annotatedImg, pngOutPath);

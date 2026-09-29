@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- [Segment 36] Small translucent badge behind the "Anatomy ROI" toggle,
+     top-end of the camera preview. Same surface_banner tone as
+     bg_no_face_banner.xml (opaque enough to read over live video), smaller
+     corner radius befitting a compact control rather than a centered
+     banner. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="@color/surface_banner" />
+    <corners android:radius="12dp" />
+</shape>

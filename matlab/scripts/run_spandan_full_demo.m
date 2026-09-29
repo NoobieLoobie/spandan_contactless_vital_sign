@@ -20,7 +20,7 @@
 %         script's own reference implementation is NOT modified and NOT
 %         re-derived from scratch here -- see extractMultiCycleWindow
 %         below, a separate local copy for the same reason
-%         run_spandan_interactive.m's renderInteractiveFigure is a
+%         run_spandan_interactive_anatomy_roi.m's renderInteractiveFigure is a
 %         separate implementation from this file's own
 %         renderSpandanDemoFigure: MATLAB script-local functions cannot be
 %         imported across files). Panel (iii) and (iv) are captioned to
@@ -28,6 +28,19 @@
 %   (v)   a text panel: HR (chrom/pos/green, bpm), SpO2 (%), and notch
 %         confidence
 % Saved to results/figures/spandan_demo_<subjectID>.png.
+%
+% [2026-09-29, Segment 35 promotion] pipeline/estimateVitalsAndMorphology.m's
+% opts.useAnatomyROI now defaults to true, so this script (calling that
+% function with a raw video path and no opts override) now runs the
+% MediaPipe FaceMesh anatomy ROI instead of the plain face-box ROI. This
+% adds a real new dependency this file's header never previously had:
+% pyenv('ExecutionMode','OutOfProcess') + a working MediaPipe install
+% (estimateVitalsAndMorphology.m auto-sets the pyenv mode if not yet
+% loaded, but cannot fix it if something else already loaded Python
+% in-process first in the same MATLAB session). See
+% matlab/docs/Segment35_MediaPipe_Anatomy_ROI.md for the promotion
+% evidence/caveats. Pass struct('useAnatomyROI', false) at this script's
+% own call site below to reproduce the pre-2026-09-29 plain-box-ROI demo.
 %
 % Does NOT modify pipeline/estimateVitalsAndMorphology.m,
 % morphology/resampleUniform.m, morphology/ensembleAverageBeats.m,

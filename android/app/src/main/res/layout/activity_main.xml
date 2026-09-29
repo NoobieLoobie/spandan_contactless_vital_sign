@@ -67,6 +67,43 @@
             android:layout_gravity="bottom"
             android:background="@drawable/bg_preview_scrim_bottom" />
 
+        <!-- [Segment 36] User-facing toggle for the MediaPipe FaceLandmarker
+             anatomy ROI (forehead + both cheeks, landmark-driven) vs. the
+             classical face-box ROI. OFF by default (see MainActivity's
+             ANATOMY_ROI_DEFAULT) — HONEST STATUS: this Android port is
+             new and not on-device verified this session (no physical device
+             attached in this environment); the underlying MATLAB anatomy ROI
+             itself was promoted on real evidence but its Own Dataset
+             follow-up found a real accuracy regression on POS specifically
+             (matlab/docs/Segment36_Own_Dataset_Evaluation.md) — this is an
+             experimental "try it and compare" control, not a validated
+             default the way minFaceSize/Kalman tracking are. -->
+        <LinearLayout
+            android:id="@+id/anatomyRoiToggleRow"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top|end"
+            android:layout_margin="12dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="@drawable/bg_anatomy_roi_toggle"
+            android:paddingHorizontal="10dp"
+            android:paddingVertical="4dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="6dp"
+                android:text="@string/anatomy_roi_toggle_label"
+                android:textColor="@color/text_secondary"
+                android:textSize="11sp" />
+
+            <androidx.appcompat.widget.SwitchCompat
+                android:id="@+id/anatomyRoiSwitch"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content" />
+        </LinearLayout>
+
         <!-- Segment 16 Task 3: NEW. Shown/hidden by MainActivity based on
              how long it's been since a face was last detected (a brief gap
              between frames is normal and should NOT flash this banner —
