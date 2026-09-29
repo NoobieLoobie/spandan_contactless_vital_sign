@@ -1,9 +1,11 @@
-# Segment 35 Phase 4 — On-device test protocol (prepared, NOT run this session)
+# Segment 35 Phase 4 — On-device test protocol
 
-Status: **prepared, ON HOLD.** Asked Abrar full-vs-reduced matrix (§0); answer was
-**"not now — hold off on Phase 4"** (2026-09-28). This doc stays ready for whenever Phase 4
-is picked back up — nothing here has been executed, and Phase 5 (SpO2 calibration) stays
-blocked on it in the meantime.
+Status: **the reduced 6-session matrix (rows 1, 4, 5, 8, 9, 12) RAN, same session, later the
+same day** — Abrar changed his mind ("let's do the option 2 of phase 4") after seeing the
+on-device fix-pack smoke test results. See `android/docs/Segment35_Phase4_Results.md` for
+the full results, including one real deviation from this protocol (USB stayed connected for
+every "handheld" session — see that doc's own note). Phase 5 (SpO2 calibration) is still
+blocked on a dedicated breath-hold session, which this round did not attempt.
 
 This protocol exists so the actual on-device session is just Abrar holding the phone while a
 Claude Code session watches `adb logcat` and times each recording. Read

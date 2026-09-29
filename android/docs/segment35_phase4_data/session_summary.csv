@@ -1,0 +1,7 @@
+session,build,placement,power,csv_file,rows,duration_s,displayed_hr_bpm,displayed_spo2_pct,oximeter_spo2_pct,oximeter_pr_bpm_range,notes
+1,A_old,stand,USB,spandan_cal_20260929_062310.csv,2296,186,58,96.92,93,72-76,
+4,A_old,handheld,USB,spandan_cal_20260929_063116.csv,4547,186,72,96.92,93,79-85,USB stayed connected (not truly unplugged) per Abrar
+5,B_fixpack,stand,USB,spandan_cal_20260929_063649.csv,4056,186,77,96.92,93,74-78,displayed HR within oximeter range this time
+8,B_fixpack,handheld,USB,spandan_cal_20260929_072046.csv,4170,186,153,96.86,96,80-95,large HR miss under handheld motion (not a clean 2x harmonic of 80-95)
+9,C_locked,stand,USB,spandan_cal_20260929_074615.csv,4370,193,96,96.83,95,78-83,6 re-locks during session (4 brightness-drift 2 face-reacquired); 17.6% clipped pixels; HR miss ~13-18bpm high
+12,C_locked,handheld,USB,spandan_cal_20260929_075049.csv,4248,185,53,96.79,95,82-86,6 re-locks (all brightness-drift, ~1/30s); still Warming up at session end from last relock 36s before stop; large HR miss
