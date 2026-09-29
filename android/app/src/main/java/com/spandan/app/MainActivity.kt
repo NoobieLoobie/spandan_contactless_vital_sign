@@ -161,6 +161,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var oximeterInsetImage: ImageView
     private lateinit var unmirrorPreviewSwitch: SwitchCompat
     private var lastOximeterInsetUpdateElapsedMs = 0L
+    /** Whether the guide box/inset/crop computation are active -- set once
+     *  the developer panel is opened for the first time and STAYS true even
+     *  after the panel is collapsed again (see the long-click listener's own
+     *  comment). Independent of [calibrationPanel]'s own visibility, which
+     *  only governs whether its buttons/switches/status text are shown. */
+    private var oximeterFeaturesActive = false
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -352,13 +358,20 @@ class MainActivity : AppCompatActivity() {
      * thread) and -- while recording -- saves it as a JPEG via
      * [CalibrationRecorder.saveOximeterCrop] (which does its own 1 Hz
      * throttling). Runs on [analysisExecutor] (this is called from the
-     * `ImageAnalysis.Analyzer` lambda, not the UI thread), gated on the
-     * calibration panel being open -- a debug/calibration feature, not
-     * something every live session should pay the crop cost for.
+     * `ImageAnalysis.Analyzer` lambda, not the UI thread), gated on
+     * [oximeterFeaturesActive] (sticky once the developer panel has been
+     * opened once this session, independent of the panel's own current
+     * visibility -- see that field's own KDoc) -- a debug/calibration
+     * feature, not something every live session should pay the crop cost
+     * for by default.
      */
     @ExperimentalGetImage
     private fun offerOximeterGuideCrop(imageProxy: ImageProxy) {
-        if (calibrationPanel.visibility != View.VISIBLE) return
+        // [Segment 35 Phase 3] gated on oximeterFeaturesActive (sticky once
+        // the panel has been opened once), NOT on the panel's own current
+        // visibility -- so the guide box/inset/recording keep working after
+        // the panel is collapsed out of the way. See that field's own KDoc.
+        if (!oximeterFeaturesActive) return
 
         // [Segment 35 Phase 3, FIXED on real-device test] A real capture
         // (Galaxy A35) found raw analysis throughput collapse from ~29fps to
@@ -472,11 +485,18 @@ class MainActivity : AppCompatActivity() {
         findViewById<View>(R.id.vitalsCard).setOnLongClickListener {
             val nowVisible = calibrationPanel.visibility != View.VISIBLE
             calibrationPanel.visibility = if (nowVisible) View.VISIBLE else View.GONE
-            // [Segment 35 Phase 3] the guide box + inset are calibration/
-            // debug aids -- shown together with the developer panel, not a
-            // separate always-visible UI element.
-            overlayView.showOximeterGuide = nowVisible
-            oximeterInsetImage.visibility = if (nowVisible) View.VISIBLE else View.GONE
+            // [Segment 35 Phase 3, decoupled from the panel after Abrar's
+            // own feedback: the panel only needs to be open long enough to
+            // tap Start rec / toggle Locked linear -- once turned on,
+            // oximeterFeaturesActive STAYS on (sticky, "OR" not "=") even
+            // after the panel is collapsed again, so the guide box + live
+            // inset keep running unobstructed by the panel's own controls,
+            // and recording/locked-capture continue in the background. No
+            // UI to turn it back off this session -- accepted simplification
+            // for a debug/calibration feature; relaunching the app resets it.
+            oximeterFeaturesActive = oximeterFeaturesActive || nowVisible
+            overlayView.showOximeterGuide = oximeterFeaturesActive
+            oximeterInsetImage.visibility = if (oximeterFeaturesActive) View.VISIBLE else View.GONE
             true
         }
         unmirrorPreviewSwitch.setOnCheckedChangeListener { _, checked ->

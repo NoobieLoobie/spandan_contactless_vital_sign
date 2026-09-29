@@ -30,7 +30,7 @@ written (2026-09-28, before that test).
 | 3. Uniform resample | Branch 1 (HR + SpO2) now resamples to a uniform 30Hz grid via real per-sample sensor timestamps before filtering, same as Branch 2 already did | **CONFIRMED ACTIVE on real device** — every log line shows `resampled=true`, real fs 30.00Hz from ~15-30 raw fps depending on mode (§4.4) |
 | 4. Widened ROI (RGBA_8888 REVERTED) | 1280x720, stride 1 (was 2), forehead+both cheeks pooled (was forehead only) — the RGBA_8888 output format itself was reverted to YUV_420_888 after a real crash (§4.1) | **Multi-region ROI confirmed rendering correctly live** (§4.4 screenshot: 3 yellow boxes, forehead + both cheeks); resolution/stride change not separately fps-profiled |
 | 5. Oximetry auto re-lock | Re-locks on >15% ROI brightness drift or face reacquired after loss; clears signal buffer on every re-lock | **Real bug found + fixed on-device** (§4.2): an immediate re-lock cascade (1-2.6s apart) — added a 3s post-lock settle window. Confirmed real Camera2 PREROLL→METERING→LOCKED sequence completes and holds; **RELOCK_SETTLE_MS=3000/RELOCK_DRIFT_FRACTION=0.15 still not properly tuned** (§4.2's honest caveat) |
-| Oximeter viewing box (Phase 3) | Guide box + labeled overlay, view→sensor crop mapping, live upright un-mirrored inset, once/sec JPEG saved into the existing calibration recorder, full-preview un-mirror fallback toggle | **Real throughput bug found + fixed** (§4.3): the crop was computed on every frame, not just its outputs throttled — fps collapsed 29.5→8.5/s while the panel was open; fixed by throttling the extraction itself. Guide box/inset render (partially covered by the dev panel's own layout, §4.5); **not tried with an actual oximeter** |
+| Oximeter viewing box (Phase 3) | Guide box + labeled overlay, view→sensor crop mapping, live upright un-mirrored inset, once/sec JPEG saved into the existing calibration recorder, full-preview un-mirror fallback toggle | **Two real bugs found + fixed**: (§4.3) throughput collapsed 29.5→8.5/s while the panel was open, fixed by throttling the crop extraction itself; (§4.5, on Abrar's own suggestion) guide box/inset were tied to the panel's own visibility — decoupled via a sticky `oximeterFeaturesActive` flag, so they now keep running after the panel is collapsed. Re-verified live, both fixes together; **still not tried with an actual oximeter** |
 
 **Nothing here is promoted as a validated default.** Every numeric choice (0.18 minFaceSize,
 0.5s gap threshold, 15% drift threshold, 30Hz resample target, the guide box's screen
@@ -335,20 +335,38 @@ untested, it had a real, severe cost that is now fixed.
   only; this is not the handheld/arm's-length motion test Phase 4 still needs.
 - **Developer panel + guide box + un-mirror switch**: panel opens/closes via long-press, the
   new "Un-mirror preview" switch is present and wired (not separately confirmed to flip the
-  preview visually this session), the guide box's dashed outline and "Keep oximeter screen
-  here" label render (partially obscured by the panel itself, see §4.5).
+  preview visually this session); the guide box's dashed outline, "Keep oximeter screen here"
+  label, and the live inset all render correctly and **stay visible and updating after the
+  panel is collapsed** (§4.5 — fixed same session).
 - **Oximetry lock (Segment 34 logic, unaffected by this session's changes)**: real
   PREROLL→METERING→LOCKED sequence, linear tone curve applied, AE/AWB genuinely lock.
 
-### 4.5 New minor finding, not fixed this session: dev panel overlaps the guide box/inset
+### 4.5 Dev panel overlaps the guide box/inset — FIXED same day, on Abrar's own suggestion
 
-The calibration panel (`calibrationPanel`, opened for exactly the controls a real Phase 4
-session needs) visually overlaps the same top region `OximeterGuideBox`'s guide rectangle
-and `oximeterInsetImage`'s inset occupy — so while positioning an oximeter (which needs the
-panel open, to see status / hit Start rec), the guide box is only partially visible and the
-live inset is fully hidden behind the panel. Not fixed here (a design decision — move the
-inset, shrink/reflow the panel, or accept glancing at the guide before opening the panel —
-needs Abrar's input on what's actually usable in practice, not a guess). Flagged for Phase 4.
+Found in §4.4 above, and fixed immediately when Abrar asked "can't we do the developer panel
+part in the background... not showing the panel on the screen?" — exactly the right question:
+the panel only needs to be visible long enough to tap Start rec / toggle Locked linear; the
+guide box, live inset, and recording/locked-capture themselves don't need it open at all.
+
+**Root cause**: `overlayView.showOximeterGuide`, `oximeterInsetImage.visibility`, and
+`offerOximeterGuideCrop`'s own throttle gate were all tied directly to `calibrationPanel.
+visibility` — closing the panel to get it out of the way also turned off the guide box/inset/
+crop computation, defeating the purpose of collapsing it.
+
+**Fix**: a new `oximeterFeaturesActive: Boolean` field, set once the panel is opened for the
+first time and **sticky** (`oximeterFeaturesActive = oximeterFeaturesActive || nowVisible` —
+an OR, never reset to false by this code) even after the panel is collapsed again. The guide
+box, inset, and crop-extraction gate all now read this field instead of the panel's own
+current visibility. No UI to explicitly turn it back off this session (accepted
+simplification for a debug feature — relaunching the app resets it).
+
+**Re-verified live on the device**: opened the panel (guide box partially visible behind it,
+as before), closed it again (long-press) — the panel's buttons/switches/status text
+disappeared, and the guide box's dashed outline + "Keep oximeter screen here" label, AND the
+live upright inset (top-right, showing real content), were BOTH still visible and updating,
+unobstructed, with HR/SpO2 still live (75bpm/96.94%, both green) and Branch 2's notch
+confidence now above the 0.3 bar (0.44, ABPF comb) once the camera had a few seconds to
+settle on the now-unobstructed frame. Zero crashes; same stable process.
 
 ### 4.6 What is still NOT on-device verified after this smoke test
 
@@ -374,8 +392,8 @@ needs Abrar's input on what's actually usable in practice, not a guess). Flagged
 5. `RELOCK_SETTLE_MS`/`RELOCK_DRIFT_FRACTION`'s real false-positive/negative rate under
    controlled conditions (§4.2's honest caveat — the ad-hoc test wasn't controlled).
 6. Whether the oximeter guide box's position/size is actually usable one-handed with a real
-   oximeter, whether the inset crop is legible enough to read digits from, and what to do
-   about §4.5's panel/guide-box overlap.
+   oximeter, and whether the inset crop is legible enough to read digits from (the panel/
+   guide-box overlap itself is fixed, §4.5).
 
 This is exactly Segment 35 Phase 4's own test matrix — see `docs/Segment35_Phase4_
 OnDevice_Test_Protocol.md` for the consolidated protocol (currently on hold per Abrar).
