@@ -169,7 +169,7 @@ re-confirmed** — that hiccup could not be forced on demand — but subsequent 
 windows did not reproduce the permanent-freeze symptom, only the milder cycling described
 next.
 
-### 6.3 Remaining, unresolved characteristic: more frequent "Warming up" cycling than classical mode
+### 6.3 More frequent "Warming up" cycling than classical mode (RESOLVED 2026-09-30, see §6.5)
 
 Even after both fixes above, sustained monitoring windows showed the UI cycling through
 "No face detected" / "Re-acquiring signal" more often than the classical `FaceAnalyzer`
@@ -190,6 +190,74 @@ site, `onLandmarkResult()`, `emitBoxesResultFromBitmap()`, and `emitBoxesResult(
 this investigation have been **removed** now that the two real bugs above are fixed and
 this characteristic is documented — normal operation no longer logs per-frame diagnostics
 from this analyzer (only the pre-existing `onLandmarkError` warning path remains).
+
+### 6.5 Follow-up session (2026-09-30): root cause of §6.3 fixed, plus a native crash
+
+(Placed before §6.4 so the "still needed" list stays last.)
+
+**Root cause of the §6.3 cycling.** The analyzer's own design put ML inference on the rPPG
+sampling path. The analysis stream is 1280x720 (MainActivity's `ResolutionSelector`), and on
+**every** frame, including skipped-detection frames, the analyzer did the following just to
+average about 19k ROI pixels:
+- converted the whole frame to an ARGB Bitmap in Kotlin;
+- made a second full-size rotated copy;
+- ran a full `getPixels`.
+
+On detection frames it also held the `ImageProxy` open until FaceLandmarker's callback
+fired. Under `STRATEGY_KEEP_ONLY_LATEST` that means the camera delivered no new frame while
+inference ran. Any slow inference or GC pause then pushed the sample gap past
+`SignalBuffer.GAP_CLEAR_THRESHOLD_SECONDS` (0.5 s), which cleared the buffer and showed
+"Re-acquiring signal". A LIVE_STREAM frame that MediaPipe's flow limiter drops without
+calling back would also have stalled the camera permanently. That is a plausible second
+route to the §6.2 freeze.
+
+**Fix (running the ML model properly on the phone):**
+1. **Inference is decoupled from sampling.** Every `ImageProxy` is closed synchronously in
+   `analyze()`. The rPPG sample for every frame is pooled from the most recent landmark
+   boxes, so the sample rate is the camera rate, whatever the inference latency.
+2. **No full-frame Bitmap on the sampling path.** The new
+   `AnatomyRoiPixelAverager.averageRgbFromYuv` reads YUV_420_888 over only the three ROI
+   boxes, which are mapped to sensor space by `CoordinateMapper.rotatedRectToSensorRect`.
+   It uses the same BT.601 conversion and truncation as before, and the same YCbCr skin
+   mask with the same "any box < 10% skin -> unmasked for all boxes" rule. Both paths now
+   share one single-pass accumulator. `clippedPixels` is now real instead of 0.
+3. **The landmarker gets a small upright image.** The new
+   `MediaPipeImageConverter.yuv420ToUprightArgb8888Bitmap` rotates and subsamples 2x
+   (640x360) in one pass. Landmarks are normalized and get rescaled to full resolution, so
+   ROI precision is unaffected. The rotation index math is covered by
+   `MediaPipeImageConverterTest`.
+4. **At most one `detectAsync` in flight,** plus a 1 s watchdog that frees the slot if a
+   callback never arrives.
+5. **Miss grace.** After a detection that finds no face, the last boxes stay in use for
+   400 ms before NoFace is reported. The classical path's stale-box/Kalman reuse gives it
+   the same tolerance.
+6. **Lower confidence thresholds.** Detection is 0.4, and presence/tracking are 0.3
+   (library defaults are 0.5). This is a single-face selfie use case, and the skin mask
+   still rejects non-skin pixels.
+7. **Throttled `STATS` log** (every 5 s): fps, samples/s, detections/s, inference latency,
+   misses, max inter-sample gap, buffer-clearing gaps, watchdog resets. To view it:
+   `adb logcat -s AnatomyRoiFaceAnalyzer`.
+
+**Native crash found and fixed.** Flipping the Anatomy ROI switch a few times quickly
+crashed the app with a SIGSEGV (null dereference inside `libmediapipe_tasks_jni.so`, from
+`startDetection`). `MainActivity` calls `close()` on the main thread while the analysis
+thread can be inside `detectAsync`. This race predates today's changes. Now `close()` and
+`detectAsync` share a lock, and `detectAsync` is skipped once the analyzer is closed. After
+the fix, 9 rapid flips caused no crash.
+
+**On-device result (Galaxy A35, seated, indoor light, battery saver on).** Over a 90 s
+window after the rebind stress test, 5 s STATS lines showed:
+- 17.7-19.0 fps, with samples/s equal to fps;
+- inference about 130-137 ms mean on CPU (max 175 ms), at about 6 detections/s;
+- max inter-sample gap 80-120 ms and **0 buffer-clearing gaps**;
+- 0 landmark misses and 0 watchdog resets.
+
+The HR pill stayed "Live" at every 15 s UI poll, for the whole window.
+
+**Not tested this session:**
+- walking out of frame and back (face-loss/recovery);
+- a forced Camera2 hiccup;
+- the classical-vs-anatomy fps comparison under identical battery-saver conditions.
 
 ### 6.4 Still needed
 

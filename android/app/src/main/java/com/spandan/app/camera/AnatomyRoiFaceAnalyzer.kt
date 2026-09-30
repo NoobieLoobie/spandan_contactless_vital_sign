@@ -1,10 +1,9 @@
 package com.spandan.app.camera
 
 import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.Matrix
 import android.graphics.Rect
 import android.media.Image
+import android.os.SystemClock
 import android.util.Log
 import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageAnalysis
@@ -15,6 +14,9 @@ import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarker
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
+import com.spandan.app.signal.RgbSample
+import com.spandan.app.signal.SignalBuffer
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * [Segment 36] `ImageAnalysis.Analyzer` for the "anatomy ROI" toggle --
@@ -35,43 +37,53 @@ import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
  * that a KLT-TRACKED landmark ROI regressed 2/5 UBFC subjects vs. a plain
  * box. That finding is about optical-flow TRACKING of one frame's landmarks
  * across many subsequent frames -- a different technique from what this
- * file does, which is a REAL per-detection-frame FaceMesh/FaceLandmarker
- * call (frozen only between the same every-Nth-frame skip window every
- * other analyzer in this app already uses, not tracked via pixel-content
- * motion estimation). This is the Android port of
+ * file does, which is a REAL, repeated FaceLandmarker call whose latest
+ * result is reused only until the next one lands (not tracked via
+ * pixel-content motion estimation). This is the Android port of
  * `faceMeshAnatomyROIExtraction.m` specifically (Segment 35 Phase 1),
  * which already showed a real, Holm-significant HR accuracy effect on
- * MATLAB (`matlab/docs/Segment35_MediaPipe_Anatomy_ROI.md`) -- a materially
- * different, more direct precedent than the KLT-tracking result Segment 30
- * was avoiding. Segment 30's OTHER finding -- the YUV->Bitmap conversion tax
- * (measured ~71ms of ~87ms bundled MediaPipe cost on a Galaxy A35) -- DOES
- * apply here identically (MediaPipe Tasks Vision's Android packet creator
- * rejects raw YUV_420_888 through any zero-copy path, confirmed by Segment
- * 30 and not re-litigated here) and is accepted as a real, disclosed cost of
- * this being an opt-in "quality" toggle, not the default camera path.
+ * MATLAB (`matlab/docs/Segment35_MediaPipe_Anatomy_ROI.md`). MediaPipe Tasks
+ * Vision's Android packet creator rejects raw YUV_420_888 through any
+ * zero-copy path (Segment 30), so the landmarker input must still be an
+ * ARGB Bitmap -- but see THREADING below for how that cost is now kept off
+ * the rPPG sampling path.
  *
  * COORDINATE SPACE: unlike [FaceAnalyzer]'s MediaPipe FaceDetector branch
  * (which passes the RAW sensor-orientation bitmap + a rotation HINT, then
- * has to un-rotate ONE returned box afterward via
- * [CoordinateMapper.mediaPipeSensorBoxToRotatedRect]), this analyzer
- * physically rotates the converted [Bitmap] to upright BEFORE calling
- * FaceLandmarker. Nine independent landmark points would need that same
- * fix applied nine times over if left in sensor space, so pre-rotating once
- * is simpler and less bug-prone -- landmarks then come back directly
- * relative to the upright image, exactly matching
- * faceMeshAnatomyROIExtraction.m's own convention (MATLAB decodes an
- * already-upright VideoReader frame). See [AnatomyRoiCalculator]'s own KDoc
- * for the same point from the landmark-math side.
+ * has to un-rotate ONE returned box afterward), this analyzer builds an
+ * already-upright (and downscaled) bitmap for FaceLandmarker, so the
+ * normalized landmarks come back relative to the upright image, exactly
+ * matching faceMeshAnatomyROIExtraction.m's own convention (MATLAB decodes an
+ * already-upright VideoReader frame). They are scaled by the FULL-resolution
+ * upright dimensions, so boxes live in the same rotated space [FaceAnalyzer]'s
+ * boxes do, and are mapped to sensor space with
+ * [CoordinateMapper.rotatedRectToSensorRect] for pixel averaging.
  *
- * HONEST STATUS: built and unit-tested (pure math in [AnatomyRoiCalculator]/
- * [AnatomyRoiPixelAverager]) but NOT on-device verified this session (no
- * physical Android device attached to this environment) -- unlike most of
- * this project's prior Android segments, which had real device access
- * partway through. Do not treat this as validated the way
- * `FaceAnalyzer.kt`'s promoted defaults are; treat every fps/accuracy claim
- * in this file's own KDoc as inherited from Segment 30/35's MEASUREMENTS on
- * a related but not identical code path, not as a fresh measurement of this
- * exact file.
+ * THREADING / SAMPLING MODEL ([Segment 36 on-device fix, 2026-09-30]): the
+ * first on-device version held each detection frame's [ImageProxy] open
+ * until FaceLandmarker's LIVE_STREAM callback fired, and converted the FULL
+ * 1280x720 frame to an ARGB Bitmap (plus a rotated copy) on EVERY frame --
+ * including skipped-detection frames, just to average ~19k ROI pixels. With
+ * KEEP_ONLY_LATEST backpressure the camera delivered no new frame while
+ * inference ran, so the rPPG sample stream inherited every inference stall,
+ * and a one-off slow inference/GC pause could push the inter-sample gap past
+ * [SignalBuffer.GAP_CLEAR_THRESHOLD_SECONDS], clearing the buffer
+ * ("Re-acquiring signal") -- the "more frequent cycling than classical mode"
+ * characteristic Segment36_Anatomy_ROI_Port.md §6.3 recorded. It also meant
+ * a LIVE_STREAM frame dropped without a callback would never close its
+ * ImageProxy and would stall the camera for good. Now:
+ *
+ *  - every frame's [ImageProxy] is closed synchronously in [analyze];
+ *  - the rPPG sample is pooled straight from YUV over ONLY the ROI boxes
+ *    ([AnatomyRoiPixelAverager.averageRgbFromYuv]) using the most recent
+ *    landmark boxes, so the sample rate is the camera rate, independent of
+ *    inference latency;
+ *  - FaceLandmarker runs asynchronously on a 1/[DETECTION_DOWNSCALE_STEP]
+ *    upright copy, at most one call in flight, with a watchdog that frees the
+ *    slot if a callback never arrives;
+ *  - a single missed landmark result no longer drops the face: the last
+ *    boxes are kept for [MISS_GRACE_MS] before NoFace is reported (the
+ *    classical path's stale-box/Kalman reuse gives it the same tolerance).
  */
 class AnatomyRoiFaceAnalyzer(
     context: Context,
@@ -81,46 +93,57 @@ class AnatomyRoiFaceAnalyzer(
     private val faceLandmarker: FaceLandmarker = buildFaceLandmarker(context)
 
     private var frameCounter = 0
-    private var lastBoxes: AnatomyRoiCalculator.AnatomyBoxes? = null
 
-    // Single in-flight LIVE_STREAM call state -- same safety argument as
-    // FaceAnalyzer's own pendingMediaPipeImageProxy (STRATEGY_KEEP_ONLY_LATEST
-    // on a single-threaded executor means at most one detectAsync is ever
-    // in flight).
-    private var pendingImageProxy: ImageProxy? = null
-    private var pendingRotatedBitmap: Bitmap? = null
-    private var pendingRotatedImageWidth = 0
-    private var pendingRotatedImageHeight = 0
+    /** Latest landmark-derived boxes in full-resolution upright space --
+     *  written by MediaPipe's callback thread, read by the analysis
+     *  executor. */
+    @Volatile private var latestBoxes: AnatomyRoiCalculator.AnatomyBoxes? = null
+    @Volatile private var lastLandmarkHitMs = 0L
+
+    private val detectionInFlight = AtomicBoolean(false)
+    @Volatile private var detectionStartedMs = 0L
+    @Volatile private var closed = false
+
+    // [Real bug, found on-device 2026-09-30] close() runs on the main thread
+    // (MainActivity.bindUseCases on a toggle flip) while analyze() may be
+    // inside detectAsync on the analysis executor. Closing the native task
+    // graph mid-call was a SIGSEGV (null deref inside
+    // libmediapipe_tasks_jni.so, reproduced by flipping the toggle a few
+    // times quickly). Both calls now hold this lock, and detectAsync is
+    // skipped once closed.
+    private val landmarkerLock = Any()
+
+    // Upright full-res dimensions of the frame the in-flight detection was
+    // taken from -- landmarks are normalized, so they are scaled by these,
+    // not by the downscaled bitmap's own size.
+    @Volatile private var pendingRotatedWidth = 0
+    @Volatile private var pendingRotatedHeight = 0
 
     // [Real bug, found on-device 2026-09-29] MediaPipe Tasks Vision's
     // LIVE_STREAM mode requires STRICTLY INCREASING timestamps across
-    // detectAsync calls -- undocumented consequence, confirmed empirically
-    // this session: a real Camera2 session hiccup (logcat showed
-    // CameraManagerGlobal briefly reporting STATUS_NOT_AVAILABLE, then
-    // CameraX transparently reopening the SAME camera and reusing this
-    // SAME analyzer instance -- ordinary CameraX recovery, not a rebind
-    // through MainActivity.bindUseCases()) made imageProxy.imageInfo.timestamp
-    // reset to a lower value on the reopened session. FaceLandmarker
-    // silently stopped invoking onLandmarkResult/onLandmarkError for the
-    // REST OF THE APP SESSION after that one non-monotonic call -- no
-    // crash, no error callback, just permanent silence, which froze the
-    // HR/SpO2 display at their last real values while `lastStatus` stayed
-    // whatever it was before (observed: stuck at "Warming up" with a
-    // ~30s-stale bpm/SpO2% on screen). The classical FaceAnalyzer.kt path
-    // never had this failure mode because ML Kit's InputImage.fromMediaImage
-    // is a stateless per-call Task with no cross-call timestamp contract --
-    // this is specific to MediaPipe's LIVE_STREAM API. Fixed by clamping
-    // every timestamp sent to detectAsync to be strictly greater than the
-    // last one actually sent, regardless of what the camera reports.
+    // detectAsync calls. A real Camera2 session hiccup (CameraManagerGlobal
+    // briefly reporting STATUS_NOT_AVAILABLE, then CameraX transparently
+    // reopening the SAME camera and reusing this SAME analyzer instance)
+    // reset imageProxy.imageInfo.timestamp to a lower value, and
+    // FaceLandmarker silently stopped invoking its callbacks for the rest of
+    // the session. Clamped so that can never recur.
     private var lastSentTimestampMs = 0L
+
+    private val stats = Stats()
 
     @ExperimentalGetImage
     override fun analyze(imageProxy: ImageProxy) {
-        val mediaImage = imageProxy.image
-        if (mediaImage == null) {
+        try {
+            analyzeFrame(imageProxy)
+        } finally {
             imageProxy.close()
-            return
         }
+    }
+
+    @ExperimentalGetImage
+    private fun analyzeFrame(imageProxy: ImageProxy) {
+        val mediaImage = imageProxy.image ?: return
+        if (closed) return
 
         val rotationDegrees = imageProxy.imageInfo.rotationDegrees
         val rotatedImageWidth: Int
@@ -134,146 +157,118 @@ class AnatomyRoiFaceAnalyzer(
         }
 
         frameCounter++
-        val staleBoxes = lastBoxes
-        val shouldSkipDetection = staleBoxes != null && frameCounter % DETECT_EVERY_N_FRAMES != 0
+        val nowMs = SystemClock.elapsedRealtime()
+        stats.onFrame(nowMs)
 
-        if (shouldSkipDetection) {
-            // Frozen between real detections, same discipline FaceAnalyzer's
-            // own default (no motion-tracking/Kalman) path uses for its
-            // single face box -- no measured landmark-specific tracker
-            // exists, and matlab/docs/Segment7_Task_D_Landmark_ROI.md's own
-            // KLT-tracking negative result is a real reason not to reach for
-            // one without new evidence.
-            emitBoxesResult(staleBoxes!!, rotatedImageWidth, rotatedImageHeight, imageProxy, sensorTimestampNs = imageProxy.imageInfo.timestamp)
-            imageProxy.close()
-            return
+        if (detectionInFlight.get() && nowMs - detectionStartedMs > DETECTION_WATCHDOG_MS) {
+            // No callback for this long means MediaPipe dropped the frame
+            // (or is wedged) -- free the slot so detection keeps going.
+            detectionInFlight.set(false)
+            stats.watchdogResets++
         }
 
-        val rawBitmap = MediaPipeImageConverter.yuv420ToArgb8888Bitmap(mediaImage)
-        val rotatedBitmap = rotateBitmap(rawBitmap, rotationDegrees)
-        if (rotatedBitmap !== rawBitmap) rawBitmap.recycle()
+        val boxes = latestBoxes
+        val wantDetection = boxes == null || frameCounter % DETECT_EVERY_N_FRAMES == 0
+        if (wantDetection && detectionInFlight.compareAndSet(false, true)) {
+            startDetection(mediaImage, imageProxy, rotationDegrees, rotatedImageWidth, rotatedImageHeight, nowMs)
+        }
 
-        pendingImageProxy = imageProxy
-        pendingRotatedBitmap = rotatedBitmap
-        pendingRotatedImageWidth = rotatedImageWidth
-        pendingRotatedImageHeight = rotatedImageHeight
+        // No face known yet: nothing to sample. NoFace itself is reported
+        // from the landmark callback, which is what actually knows.
+        if (boxes == null) return
 
-        val mpImage = BitmapImageBuilder(rotatedBitmap).build()
-        // Clamp to strictly increasing -- see lastSentTimestampMs's own KDoc
-        // for the real on-device failure this prevents (a camera-session
-        // hiccup resetting imageProxy.imageInfo.timestamp permanently
-        // silences FaceLandmarker's LIVE_STREAM callbacks otherwise).
-        val rawTimestampMs = imageProxy.imageInfo.timestamp / 1_000_000
-        val sendTimestampMs = maxOf(rawTimestampMs, lastSentTimestampMs + 1)
-        lastSentTimestampMs = sendTimestampMs
-        faceLandmarker.detectAsync(mpImage, sendTimestampMs)
+        val sensorRegions = listOf(boxes.forehead, boxes.leftCheek, boxes.rightCheek).map { rect ->
+            CoordinateMapper.rotatedRectToSensorRect(rect, rotationDegrees, imageProxy.width, imageProxy.height)
+        }
+        val rgbSample = AnatomyRoiPixelAverager.averageRgbFromYuv(imageProxy, sensorRegions)
+        if (rgbSample != null) stats.onSample(rgbSample.sensorTimestampNs)
+        onResult(toFaceDetected(boxes, rotatedImageWidth, rotatedImageHeight, rgbSample, imageProxy.imageInfo.timestamp))
     }
 
-    /** Shared LIVE_STREAM resultListener -- see [analyze]'s own note on why
-     *  per-call state lives in [pendingImageProxy] and friends. */
-    private fun onLandmarkResult(result: FaceLandmarkerResult, @Suppress("UNUSED_PARAMETER") input: MPImage) {
-        val imageProxy = pendingImageProxy
-        val rotatedBitmap = pendingRotatedBitmap
-        val rotatedImageWidth = pendingRotatedImageWidth
-        val rotatedImageHeight = pendingRotatedImageHeight
-        pendingImageProxy = null
-        pendingRotatedBitmap = null
-        if (imageProxy == null || rotatedBitmap == null) return // stray callback
-
-        val faces = result.faceLandmarks()
-        if (faces.isEmpty()) {
-            lastBoxes = null
-            onResult(FaceAnalysisResult.NoFace)
-            rotatedBitmap.recycle()
-            imageProxy.close()
-            return
-        }
-
-        // Only one face requested (setNumFaces(1)); take it directly.
-        val landmarksList = faces[0]
-        val landmarks = HashMap<Int, FloatArray>(AnatomyRoiCalculator.REQUIRED_LANDMARK_INDICES.size)
-        for (idx in AnatomyRoiCalculator.REQUIRED_LANDMARK_INDICES) {
-            if (idx < landmarksList.size) {
-                val lm = landmarksList[idx]
-                landmarks[idx] = floatArrayOf(lm.x() * rotatedImageWidth, lm.y() * rotatedImageHeight)
+    private fun startDetection(
+        mediaImage: Image,
+        imageProxy: ImageProxy,
+        rotationDegrees: Int,
+        rotatedImageWidth: Int,
+        rotatedImageHeight: Int,
+        nowMs: Long
+    ) {
+        try {
+            val bitmap = MediaPipeImageConverter.yuv420ToUprightArgb8888Bitmap(
+                mediaImage, rotationDegrees, DETECTION_DOWNSCALE_STEP
+            )
+            pendingRotatedWidth = rotatedImageWidth
+            pendingRotatedHeight = rotatedImageHeight
+            detectionStartedMs = nowMs
+            val rawTimestampMs = imageProxy.imageInfo.timestamp / 1_000_000
+            val sendTimestampMs = maxOf(rawTimestampMs, lastSentTimestampMs + 1)
+            lastSentTimestampMs = sendTimestampMs
+            // The bitmap is deliberately NOT recycled in the callback: after
+            // a watchdog reset, a late callback could otherwise recycle a
+            // bitmap MediaPipe is still reading. It is ~0.9 MB; left to GC.
+            synchronized(landmarkerLock) {
+                if (closed) {
+                    detectionInFlight.set(false)
+                    return
+                }
+                faceLandmarker.detectAsync(BitmapImageBuilder(bitmap).build(), sendTimestampMs)
             }
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "detectAsync failed to start", e)
+            detectionInFlight.set(false)
         }
+    }
 
-        val boxes = AnatomyRoiCalculator.landmarksToBoxes(landmarks, rotatedImageWidth, rotatedImageHeight)
-        lastBoxes = boxes
-        emitBoxesResultFromBitmap(boxes, rotatedBitmap, rotatedImageWidth, rotatedImageHeight, imageProxy)
-        rotatedBitmap.recycle()
-        imageProxy.close()
+    /** LIVE_STREAM resultListener (runs on MediaPipe's own callback thread). */
+    private fun onLandmarkResult(result: FaceLandmarkerResult, @Suppress("UNUSED_PARAMETER") input: MPImage) {
+        val nowMs = SystemClock.elapsedRealtime()
+        stats.onDetectionDone(nowMs - detectionStartedMs)
+        try {
+            val faces = result.faceLandmarks()
+            if (faces.isEmpty()) {
+                onLandmarkMiss(nowMs)
+                return
+            }
+
+            val rotatedImageWidth = pendingRotatedWidth
+            val rotatedImageHeight = pendingRotatedHeight
+            // Only one face requested (setNumFaces(1)); take it directly.
+            val landmarksList = faces[0]
+            val landmarks = HashMap<Int, FloatArray>(AnatomyRoiCalculator.REQUIRED_LANDMARK_INDICES.size)
+            for (idx in AnatomyRoiCalculator.REQUIRED_LANDMARK_INDICES) {
+                if (idx < landmarksList.size) {
+                    val lm = landmarksList[idx]
+                    landmarks[idx] = floatArrayOf(lm.x() * rotatedImageWidth, lm.y() * rotatedImageHeight)
+                }
+            }
+            latestBoxes = AnatomyRoiCalculator.landmarksToBoxes(landmarks, rotatedImageWidth, rotatedImageHeight)
+            lastLandmarkHitMs = nowMs
+        } finally {
+            detectionInFlight.set(false)
+        }
     }
 
     private fun onLandmarkError(e: RuntimeException) {
         Log.w(TAG, "FaceLandmarker failed for this frame", e)
-        val imageProxy = pendingImageProxy
-        val rotatedBitmap = pendingRotatedBitmap
-        pendingImageProxy = null
-        pendingRotatedBitmap = null
-        lastBoxes = null
+        onLandmarkMiss(SystemClock.elapsedRealtime())
+        detectionInFlight.set(false)
+    }
+
+    /** A detection that found no face. Keeps the last boxes through a short
+     *  grace window (one missed inference is normal pose/blur noise, not
+     *  "face gone"); only after that does the face count as lost. */
+    private fun onLandmarkMiss(nowMs: Long) {
+        stats.onLandmarkMiss()
+        if (latestBoxes != null && nowMs - lastLandmarkHitMs < MISS_GRACE_MS) return
+        latestBoxes = null
         onResult(FaceAnalysisResult.NoFace)
-        rotatedBitmap?.recycle()
-        imageProxy?.close()
-    }
-
-    /** Fresh-detection path: pixels come from the bitmap FaceLandmarker just
-     *  ran on. */
-    private fun emitBoxesResultFromBitmap(
-        boxes: AnatomyRoiCalculator.AnatomyBoxes,
-        bitmap: Bitmap,
-        rotatedImageWidth: Int,
-        rotatedImageHeight: Int,
-        imageProxy: ImageProxy
-    ) {
-        val pixels = IntArray(rotatedImageWidth * rotatedImageHeight)
-        bitmap.getPixels(pixels, 0, rotatedImageWidth, 0, 0, rotatedImageWidth, rotatedImageHeight)
-        val rgbSample = AnatomyRoiPixelAverager.averageRgb(
-            pixels, rotatedImageWidth, rotatedImageHeight,
-            listOf(boxes.forehead, boxes.leftCheek, boxes.rightCheek),
-            sensorTimestampNs = imageProxy.imageInfo.timestamp
-        )
-        onResult(toFaceDetected(boxes, rotatedImageWidth, rotatedImageHeight, rgbSample, imageProxy.imageInfo.timestamp))
-    }
-
-    /** Skipped-detection path: no fresh bitmap was converted this frame, so
-     *  this re-converts+rotates JUST for the pixel averaging (still cheaper
-     *  than also running FaceLandmarker, which [shouldSkipDetection] exists
-     *  to avoid). */
-    @ExperimentalGetImage
-    private fun emitBoxesResult(
-        boxes: AnatomyRoiCalculator.AnatomyBoxes,
-        rotatedImageWidth: Int,
-        rotatedImageHeight: Int,
-        imageProxy: ImageProxy,
-        sensorTimestampNs: Long
-    ) {
-        val mediaImage = imageProxy.image ?: run {
-            onResult(FaceAnalysisResult.NoFace)
-            return
-        }
-        val rawBitmap = MediaPipeImageConverter.yuv420ToArgb8888Bitmap(mediaImage)
-        val rotationDegrees = imageProxy.imageInfo.rotationDegrees
-        val rotatedBitmap = rotateBitmap(rawBitmap, rotationDegrees)
-        if (rotatedBitmap !== rawBitmap) rawBitmap.recycle()
-
-        val pixels = IntArray(rotatedImageWidth * rotatedImageHeight)
-        rotatedBitmap.getPixels(pixels, 0, rotatedImageWidth, 0, 0, rotatedImageWidth, rotatedImageHeight)
-        val rgbSample = AnatomyRoiPixelAverager.averageRgb(
-            pixels, rotatedImageWidth, rotatedImageHeight,
-            listOf(boxes.forehead, boxes.leftCheek, boxes.rightCheek),
-            sensorTimestampNs = sensorTimestampNs
-        )
-        rotatedBitmap.recycle()
-        onResult(toFaceDetected(boxes, rotatedImageWidth, rotatedImageHeight, rgbSample, sensorTimestampNs))
     }
 
     private fun toFaceDetected(
         boxes: AnatomyRoiCalculator.AnatomyBoxes,
         rotatedImageWidth: Int,
         rotatedImageHeight: Int,
-        rgbSample: com.spandan.app.signal.RgbSample?,
+        rgbSample: RgbSample?,
         sensorTimestampNs: Long
     ): FaceAnalysisResult.FaceDetected {
         val unionBox = Rect(boxes.forehead)
@@ -285,44 +280,26 @@ class AnatomyRoiFaceAnalyzer(
             rotatedImageWidth = rotatedImageWidth,
             rotatedImageHeight = rotatedImageHeight,
             rgbSample = rgbSample,
-            // [Real bug, found on-device 2026-09-29] Same category as the
-            // roiBoxesRotated gap below -- this field defaults to 0L, and I
-            // originally never threaded the real sensor timestamp through.
-            // Used by MainActivity for oximetry capture's per-frame
-            // metadata join and the calibration CSV, not by SignalBuffer
-            // (which reads RgbSample's OWN sensorTimestampNs field,
-            // correctly set in AnatomyRoiPixelAverager.averageRgb's call
-            // above -- so this specific gap was NOT the HR-freeze cause,
-            // but a real, separate bug in its own right).
+            // [Real bug, found on-device 2026-09-29] was never threaded
+            // through (defaulted to 0L) -- MainActivity uses it for oximetry
+            // capture's per-frame metadata join and the calibration CSV.
             sensorTimestampNs = sensorTimestampNs,
-            // [Real bug, found on-device 2026-09-29] Without this, the
-            // default (a single-element list of roiBoxRotated -- see
-            // FaceAnalysisResult's own KDoc) meant the overlay drew only
-            // the forehead box, not all 3 anatomy regions, even though
-            // the rgbSample above (computed a few lines up via
-            // averageRgb(..., listOf(boxes.forehead, boxes.leftCheek,
-            // boxes.rightCheek))) was already correctly pooling all 3 --
-            // this was a pure visualization gap, not a pixel-averaging
-            // bug. Missed originally because AnatomyRoiFaceAnalyzer.kt was
-            // written against FaceAnalyzer.kt's OLDER definition (from the
-            // android_segment30_mediapipe/ copy read during research),
-            // which predates FaceAnalysisResult gaining this field in the
-            // real production camera/FaceAnalyzer.kt.
+            // [Real bug, found on-device 2026-09-29] without this the
+            // overlay drew only the forehead box (the field's default),
+            // though all 3 regions were already pooled into rgbSample.
             roiBoxesRotated = listOf(boxes.forehead, boxes.leftCheek, boxes.rightCheek)
         )
     }
 
-    private fun rotateBitmap(bitmap: Bitmap, rotationDegrees: Int): Bitmap {
-        if (rotationDegrees == 0) return bitmap
-        val matrix = Matrix()
-        matrix.postRotate(rotationDegrees.toFloat())
-        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-    }
-
-    /** Releases native resources (loaded model + task graph). Same known gap
-     *  as [FaceAnalyzer.close] -- nothing currently calls this. */
+    /** Releases native resources (loaded model + task graph). MainActivity
+     *  calls this on every rebind that replaces this analyzer; [closed] makes
+     *  any frame already queued on the executor a no-op. */
     fun close() {
-        faceLandmarker.close()
+        synchronized(landmarkerLock) {
+            if (closed) return
+            closed = true
+            faceLandmarker.close()
+        }
     }
 
     private fun buildFaceLandmarker(context: Context): FaceLandmarker {
@@ -333,21 +310,107 @@ class AnatomyRoiFaceAnalyzer(
             .setBaseOptions(baseOptions)
             .setRunningMode(RunningMode.LIVE_STREAM)
             .setNumFaces(1)
+            .setMinFaceDetectionConfidence(MIN_DETECTION_CONFIDENCE)
+            .setMinFacePresenceConfidence(MIN_PRESENCE_CONFIDENCE)
+            .setMinTrackingConfidence(MIN_TRACKING_CONFIDENCE)
             .setResultListener(::onLandmarkResult)
             .setErrorListener(::onLandmarkError)
             .build()
         return FaceLandmarker.createFromOptions(context, options)
     }
 
+    /** Throttled throughput summary: one log line per [STATS_INTERVAL_MS],
+     *  not per frame, so it stays on in normal use. `adb logcat -s
+     *  AnatomyRoiFaceAnalyzer` verifies sample rate, inference latency and
+     *  gap behavior on any device. */
+    private class Stats {
+        private var windowStartMs = 0L
+        private var frames = 0
+        private var samples = 0
+        private var detections = 0
+        private var latencySumMs = 0L
+        private var latencyMaxMs = 0L
+        private var misses = 0
+        var watchdogResets = 0
+        private var lastSampleNs = 0L
+        private var maxGapMs = 0L
+        private var clearingGaps = 0
+
+        @Synchronized fun onFrame(nowMs: Long) {
+            if (windowStartMs == 0L) windowStartMs = nowMs
+            frames++
+            val elapsedMs = nowMs - windowStartMs
+            if (elapsedMs < STATS_INTERVAL_MS) return
+            val secs = elapsedMs / 1000.0
+            val meanLatency = if (detections > 0) latencySumMs / detections else 0L
+            Log.i(
+                TAG,
+                "STATS fps=%.1f samples/s=%.1f det/s=%.1f detLatMs(mean=%d,max=%d) misses=%d maxGapMs=%d clearingGaps=%d watchdog=%d".format(
+                    frames / secs, samples / secs, detections / secs, meanLatency, latencyMaxMs,
+                    misses, maxGapMs, clearingGaps, watchdogResets
+                )
+            )
+            windowStartMs = nowMs
+            frames = 0; samples = 0; detections = 0
+            latencySumMs = 0L; latencyMaxMs = 0L
+            misses = 0; watchdogResets = 0
+            maxGapMs = 0L; clearingGaps = 0
+        }
+
+        @Synchronized fun onSample(sensorNs: Long) {
+            samples++
+            if (lastSampleNs > 0 && sensorNs > lastSampleNs) {
+                val gapMs = (sensorNs - lastSampleNs) / 1_000_000
+                if (gapMs > maxGapMs) maxGapMs = gapMs
+                if (gapMs >= SignalBuffer.GAP_CLEAR_THRESHOLD_SECONDS * 1000) clearingGaps++
+            }
+            lastSampleNs = sensorNs
+        }
+
+        @Synchronized fun onDetectionDone(latencyMs: Long) {
+            detections++
+            latencySumMs += latencyMs
+            if (latencyMs > latencyMaxMs) latencyMaxMs = latencyMs
+        }
+
+        @Synchronized fun onLandmarkMiss() {
+            misses++
+        }
+    }
+
     companion object {
         private const val TAG = "AnatomyRoiFaceAnalyzer"
 
-        /** Same cadence as [FaceAnalyzer.DETECT_EVERY_N_FRAMES] -- run a real
-         *  FaceLandmarker detection every Nth frame, reuse the last known
-         *  anatomy boxes on the frames in between. Not independently
-         *  re-measured for this heavier detector; kept consistent rather
-         *  than guessed differently. */
+        /** Request a FaceLandmarker run every Nth frame (and every frame
+         *  while no face is known), with at most one call in flight. Same N
+         *  as [FaceAnalyzer]'s own detection cadence. */
         private const val DETECT_EVERY_N_FRAMES = 3
+
+        /** Landmarker input is the frame subsampled by this factor
+         *  (1280x720 -> 640x360); see
+         *  [MediaPipeImageConverter.yuv420ToUprightArgb8888Bitmap]. */
+        private const val DETECTION_DOWNSCALE_STEP = 2
+
+        /** How long the last landmark boxes stay in use after a detection
+         *  finds no face -- long enough to ride out one or two missed
+         *  inferences, short enough that a face that really left stops being
+         *  sampled well inside MainActivity's 1200ms "No face" debounce. */
+        private const val MISS_GRACE_MS = 400L
+
+        /** A LIVE_STREAM call with no callback after this long is treated as
+         *  dropped and its in-flight slot freed. */
+        private const val DETECTION_WATCHDOG_MS = 1000L
+
+        /** Library defaults are 0.5 for all three. Handheld at arm's length,
+         *  0.5 presence/tracking dropped the face more readily than ML Kit's
+         *  detector (§6.3). This is a single-face selfie use case with no
+         *  competing faces, and the skin mask downstream still rejects
+         *  non-skin pixels if a box lands slightly off. */
+        private const val MIN_DETECTION_CONFIDENCE = 0.4f
+        private const val MIN_PRESENCE_CONFIDENCE = 0.3f
+        private const val MIN_TRACKING_CONFIDENCE = 0.3f
+
+        private const val STATS_INTERVAL_MS = 5000L
 
         /** Bundled in `app/src/main/assets/`, downloaded from
          *  storage.googleapis.com/mediapipe-models/face_landmarker/

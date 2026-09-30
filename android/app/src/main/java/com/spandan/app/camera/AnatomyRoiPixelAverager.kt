@@ -1,6 +1,9 @@
 package com.spandan.app.camera
 
 import android.graphics.Rect
+import androidx.camera.core.ExperimentalGetImage
+import androidx.camera.core.ImageProxy
+import com.spandan.app.oximetry.OximetryMath
 import com.spandan.app.signal.RgbSample
 
 /**
@@ -49,72 +52,148 @@ object AnatomyRoiPixelAverager {
         val validBoxes = boxes.mapNotNull { clampToBitmap(it, bitmapWidth, bitmapHeight) }
         if (validBoxes.isEmpty()) return null
 
-        // Pass 1: does ANY box fall below the 10% skin-pixel floor?
         // NOT box.width()/box.height() -- confirmed this session that,
         // unlike Rect's left/top/right/bottom (real public fields, always
         // safe), width()/height() are COMPUTED METHODS on the real
         // android.graphics.Rect class and are ALSO stubbed to return 0
         // under this project's plain-JUnit harness (isReturnDefaultValues=
-        // true) -- silently zeroing `total` and making this whole skin-
-        // fraction check a no-op in every unit test, though harmless on a
-        // real device where these methods work correctly. Field arithmetic
-        // avoids the trap entirely, same discipline as [makeRect]-style
-        // Rect construction elsewhere in this package.
-        var anyTooFew = false
-        for (box in validBoxes) {
-            val total = (box.right - box.left) * (box.bottom - box.top)
-            if (total <= 0) continue
-            var skinCount = 0
-            forEachPixel(pixels, bitmapWidth, box) { r, g, b ->
-                if (isSkin(r, g, b)) skinCount++
+        // true). Field arithmetic avoids the trap entirely, same discipline
+        // as [makeRect]-style Rect construction elsewhere in this package.
+        val accumulators = validBoxes.map { box ->
+            val acc = BoxAccumulator()
+            var y = box.top
+            while (y < box.bottom) {
+                var x = box.left
+                while (x < box.right) {
+                    val p = pixels[y * bitmapWidth + x]
+                    acc.add((p shr 16) and 0xFF, (p shr 8) and 0xFF, p and 0xFF)
+                    x++
+                }
+                y++
             }
-            if (skinCount < MIN_SKIN_FRACTION * total) anyTooFew = true
+            acc
         }
+        return pool(accumulators, sensorTimestampNs)
+    }
 
-        // Pass 2: pool (concatenate-then-average, matching the MATLAB
-        // convention) using the skin mask unless Pass 1 found any box too
-        // sparse, in which case every box falls back to its raw average.
+    /**
+     * [Segment 36 on-device fix] Same skin-masked pooling as [averageRgb],
+     * but read straight from the camera's YUV_420_888 planes over ONLY the
+     * ROI boxes' own pixels -- no full-frame ARGB [android.graphics.Bitmap]
+     * conversion, rotation, or `getPixels` copy. The previous per-frame path
+     * converted the whole 1280x720 analysis frame to a Bitmap on every frame
+     * (twice on the rotated path) just to average ~19k ROI pixels, which is
+     * what throttled this analyzer's sample rate on a Galaxy A35. The skin
+     * mask is per-pixel and order-independent, so iterating each box in
+     * SENSOR space (after [CoordinateMapper.rotatedRectToSensorRect]) visits
+     * exactly the same pixel set as iterating it in upright space. YUV->RGB
+     * is the same BT.601 formula + truncation [MediaPipeImageConverter] used
+     * to build the old Bitmap, so the pooled values match the old path's.
+     */
+    @ExperimentalGetImage
+    fun averageRgbFromYuv(imageProxy: ImageProxy, sensorBoxes: List<Rect>): RgbSample? {
+        val image = imageProxy.image ?: return null
+        val width = imageProxy.width
+        val height = imageProxy.height
+        val yPlane = image.planes[0]
+        val uPlane = image.planes[1]
+        val vPlane = image.planes[2]
+        val yBuffer = yPlane.buffer
+        val uBuffer = uPlane.buffer
+        val vBuffer = vPlane.buffer
+        val yRowStride = yPlane.rowStride
+        val yPixelStride = yPlane.pixelStride
+        val uRowStride = uPlane.rowStride
+        val uPixelStride = uPlane.pixelStride
+        val vRowStride = vPlane.rowStride
+        val vPixelStride = vPlane.pixelStride
+
+        val accumulators = ArrayList<BoxAccumulator>(sensorBoxes.size)
+        for (raw in sensorBoxes) {
+            val box = clampToBitmap(raw, width, height) ?: continue
+            val acc = BoxAccumulator()
+            var y = box.top
+            while (y < box.bottom) {
+                val uvRow = y / 2
+                var x = box.left
+                while (x < box.right) {
+                    val uvCol = x / 2
+                    val yVal = yBuffer.get(y * yRowStride + x * yPixelStride).toInt() and 0xFF
+                    val uVal = (uBuffer.get(uvRow * uRowStride + uvCol * uPixelStride).toInt() and 0xFF) - 128
+                    val vVal = (vBuffer.get(uvRow * vRowStride + uvCol * vPixelStride).toInt() and 0xFF) - 128
+                    val r = (yVal + 1.402 * vVal).coerceIn(0.0, 255.0).toInt()
+                    val g = (yVal - 0.344136 * uVal - 0.714136 * vVal).coerceIn(0.0, 255.0).toInt()
+                    val b = (yVal + 1.772 * uVal).coerceIn(0.0, 255.0).toInt()
+                    acc.add(r, g, b)
+                    x++
+                }
+                y++
+            }
+            accumulators.add(acc)
+        }
+        if (accumulators.isEmpty()) return null
+        return pool(accumulators, imageProxy.imageInfo.timestamp)
+    }
+
+    /** One box's running sums, for BOTH candidate pixel populations (skin-
+     *  masked and raw) in a single pass -- which one is pooled is decided
+     *  across all boxes afterwards in [pool], exactly the old two-pass
+     *  "any box under the 10% skin floor -> no mask for any box" rule. */
+    internal class BoxAccumulator {
+        var total = 0
+        var skinCount = 0
+        var skinR = 0L
+        var skinG = 0L
+        var skinB = 0L
+        var skinClipped = 0
+        var rawR = 0L
+        var rawG = 0L
+        var rawB = 0L
+        var rawClipped = 0
+
+        fun add(r: Int, g: Int, b: Int) {
+            val clipped = r >= OximetryMath.CLIP_THRESHOLD || g >= OximetryMath.CLIP_THRESHOLD || b >= OximetryMath.CLIP_THRESHOLD
+            total++
+            rawR += r
+            rawG += g
+            rawB += b
+            if (clipped) rawClipped++
+            if (isSkin(r, g, b)) {
+                skinCount++
+                skinR += r
+                skinG += g
+                skinB += b
+                if (clipped) skinClipped++
+            }
+        }
+    }
+
+    internal fun pool(accumulators: List<BoxAccumulator>, sensorTimestampNs: Long): RgbSample? {
+        val anyTooFew = accumulators.any { it.total > 0 && it.skinCount < MIN_SKIN_FRACTION * it.total }
         var sumR = 0L
         var sumG = 0L
         var sumB = 0L
         var count = 0
-        for (box in validBoxes) {
-            forEachPixel(pixels, bitmapWidth, box) { r, g, b ->
-                if (anyTooFew || isSkin(r, g, b)) {
-                    sumR += r
-                    sumG += g
-                    sumB += b
-                    count++
-                }
+        var clipped = 0
+        for (acc in accumulators) {
+            if (anyTooFew) {
+                sumR += acc.rawR; sumG += acc.rawG; sumB += acc.rawB
+                count += acc.total; clipped += acc.rawClipped
+            } else {
+                sumR += acc.skinR; sumG += acc.skinG; sumB += acc.skinB
+                count += acc.skinCount; clipped += acc.skinClipped
             }
         }
-
         if (count == 0) return null
         return RgbSample(
             timestampMs = System.currentTimeMillis(),
             red = sumR.toFloat() / count,
             green = sumG.toFloat() / count,
             blue = sumB.toFloat() / count,
-            clippedPixels = 0,
+            clippedPixels = clipped,
             sampledPixels = count,
             sensorTimestampNs = sensorTimestampNs
         )
-    }
-
-    private inline fun forEachPixel(pixels: IntArray, bitmapWidth: Int, box: Rect, action: (r: Int, g: Int, b: Int) -> Unit) {
-        var y = box.top
-        while (y < box.bottom) {
-            var x = box.left
-            while (x < box.right) {
-                val p = pixels[y * bitmapWidth + x]
-                val r = (p shr 16) and 0xFF
-                val g = (p shr 8) and 0xFF
-                val b = p and 0xFF
-                action(r, g, b)
-                x++
-            }
-            y++
-        }
     }
 
     private fun clampToBitmap(box: Rect, bitmapWidth: Int, bitmapHeight: Int): Rect? {
@@ -133,7 +212,7 @@ object AnatomyRoiPixelAverager {
 
     /** ITU-R BT.601 digital-range RGB->YCbCr (MATLAB `rgb2ycbcr` convention),
      *  Cb/Cr only -- Y is unused by the skin-tone gate. */
-    private fun isSkin(r: Int, g: Int, b: Int): Boolean {
+    internal fun isSkin(r: Int, g: Int, b: Int): Boolean {
         val cb = 128.0 + (-37.797 * r - 74.203 * g + 112.0 * b) / 255.0
         val cr = 128.0 + (112.0 * r - 93.786 * g - 18.214 * b) / 255.0
         return cb in CB_LO.toDouble()..CB_HI.toDouble() && cr in CR_LO.toDouble()..CR_HI.toDouble()
